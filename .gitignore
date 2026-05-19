@@ -1,0 +1,22 @@
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+.DS_Store
+
+# Internal architecture plans/specs — kept locally for agent context, never
+# committed. Public repo; these would leak design context if pushed.
+docs/superpowers/
+
+# Runtime sockets
+*.sock
+
+# Coverage
+.coverage
+htmlcov/
+
+# Setuptools build artifacts
+*.egg-info/
+build/
+dist/
