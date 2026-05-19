@@ -1,10 +1,18 @@
-"""Tests for the audio module: VAD, ring buffer, resample."""
+"""Tests for the audio module: VAD, ring buffer, resample, Opus codec."""
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from gem_voice.audio import VAD, RingBuffer, resample_pcm16
+from gem_voice.audio import (
+    VAD,
+    RingBuffer,
+    resample_pcm16,
+    mono_to_stereo,
+    stereo_to_mono,
+    OpusEncoder,
+    OpusDecoder,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -109,3 +117,64 @@ def test_resample_sine_preserves_signal():
     assert len(down) == len(sine)
     vad = VAD(threshold_rms=500)
     assert vad.is_speech(down[:640]) is True
+
+
+# --- Mono <-> Stereo ----------------------------------------------------
+
+def test_mono_to_stereo_doubles_bytes():
+    mono = np.array([1, 2, 3], dtype=np.int16).tobytes()
+    stereo = mono_to_stereo(mono)
+    assert len(stereo) == len(mono) * 2
+    # Each mono sample duplicated into L+R
+    arr = np.frombuffer(stereo, dtype=np.int16)
+    assert list(arr) == [1, 1, 2, 2, 3, 3]
+
+
+def test_stereo_to_mono_halves_bytes():
+    stereo = np.array([10, 20, 30, 40], dtype=np.int16).tobytes()
+    mono = stereo_to_mono(stereo)
+    assert len(mono) == len(stereo) // 2
+    # Average of L+R per sample pair
+    arr = np.frombuffer(mono, dtype=np.int16)
+    assert list(arr) == [15, 35]
+
+
+# --- Opus codec round-trip ----------------------------------------------
+
+def test_opus_roundtrip_mono_48k():
+    """Encode 20ms of 48kHz mono sine, decode it back, verify VAD still detects speech.
+
+    discord.opus is fixed at 48kHz stereo internally. Our wrapper upmixes
+    mono→stereo before encode and downmixes stereo→mono after decode.
+    """
+    sine_16k = _read_pcm("sine_440hz_16k_1s.pcm")
+    sine_48k = resample_pcm16(sine_16k, src_rate=16000, dst_rate=48000)
+    frame_48k_mono = sine_48k[:1920]  # 20ms at 48kHz int16 mono
+
+    encoder = OpusEncoder()
+    decoder = OpusDecoder()
+
+    opus_bytes = encoder.encode(frame_48k_mono)
+    assert isinstance(opus_bytes, bytes)
+    assert len(opus_bytes) > 0
+    assert len(opus_bytes) < len(frame_48k_mono)  # Opus compresses
+
+    decoded_mono = decoder.decode(opus_bytes)
+    assert len(decoded_mono) == len(frame_48k_mono)
+
+    decoded_16k = resample_pcm16(decoded_mono, src_rate=48000, dst_rate=16000)
+    vad = VAD(threshold_rms=500)
+    assert vad.is_speech(decoded_16k[:640]) is True
+
+
+def test_opus_decode_invalid_returns_frame_not_crash():
+    """Garbage input → bytes back, no crash.
+
+    discord.opus.Decoder is forgiving — invalid packets get decoded as
+    silence-or-noise at the libopus layer, returning a full stereo frame.
+    Our wrapper downmixes to mono, so we expect 960 bytes (20ms @ 48kHz).
+    """
+    decoder = OpusDecoder()
+    result = decoder.decode(b"\x00\x01\x02")
+    assert isinstance(result, bytes)
+    assert len(result) == 960  # 480 mono samples * 2 bytes (int16)

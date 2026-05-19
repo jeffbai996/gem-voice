@@ -106,3 +106,59 @@ def resample_pcm16(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     src_idx = np.linspace(0, n_src - 1, num=n_dst, endpoint=True, dtype=np.float64)
     dst_f = np.interp(src_idx, np.arange(n_src, dtype=np.float64), src.astype(np.float64))
     return dst_f.astype(np.int16).tobytes()
+
+
+def mono_to_stereo(mono_pcm: bytes) -> bytes:
+    """Duplicate each mono int16 sample into L+R for stereo."""
+    arr = np.frombuffer(mono_pcm, dtype=np.int16)
+    stereo = np.repeat(arr, 2)
+    return stereo.tobytes()
+
+
+def stereo_to_mono(stereo_pcm: bytes) -> bytes:
+    """Average L+R int16 channels into mono."""
+    arr = np.frombuffer(stereo_pcm, dtype=np.int16).reshape(-1, 2)
+    # Convert to int32 before averaging to avoid overflow, then cast back.
+    mono = arr.astype(np.int32).mean(axis=1).astype(np.int16)
+    return mono.tobytes()
+
+
+class OpusEncoder:
+    """Wraps discord.opus.Encoder.
+
+    discord.opus is fixed at 48kHz stereo. Our wrapper accepts 48kHz mono
+    int16 input and upmixes to stereo before encoding. Output is one Opus
+    packet per 20ms frame.
+    """
+
+    SAMPLES_PER_FRAME = 960  # 20ms at 48kHz
+
+    def __init__(self):
+        from discord.opus import Encoder
+        self._enc = Encoder()
+
+    def encode(self, pcm_48k_mono: bytes) -> bytes:
+        """Encode one 20ms mono frame (1920 bytes) to one Opus packet."""
+        stereo = mono_to_stereo(pcm_48k_mono)
+        return self._enc.encode(stereo, self.SAMPLES_PER_FRAME)
+
+
+class OpusDecoder:
+    """Wraps discord.opus.Decoder. Returns mono PCM from stereo Opus output.
+
+    libopus is forgiving — invalid packets decode to silence-shaped frames
+    at the C layer, so we don't need a try/except for "garbage in." The
+    decode is at fixed 48kHz stereo internally; we downmix to mono for the
+    rest of the pipeline.
+    """
+
+    SAMPLES_PER_FRAME = 960
+
+    def __init__(self):
+        from discord.opus import Decoder
+        self._dec = Decoder()
+
+    def decode(self, opus_packet: bytes) -> bytes:
+        """Decode one Opus packet to 48kHz mono int16."""
+        stereo = self._dec.decode(opus_packet)
+        return stereo_to_mono(stereo)
