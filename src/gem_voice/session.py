@@ -112,14 +112,23 @@ class Session:
         log.info("session_started", extra={"session_id": sess_id})
         return sess_id
 
-    async def stop(self) -> bool:
+    async def stop(self, emit_event: bool = False) -> bool:
+        """Stop the active session. Returns True if there was one to stop.
+
+        emit_event: if True, push a SESSION_ENDED event before teardown. Set
+        when the session ends for a reason the parent didn't initiate (vc
+        disconnect, model error). Leave False when the parent explicitly
+        called 'leave' — they already know the session ended, and racing
+        the event against the leave ack causes ordering bugs.
+        """
         if self._active_session_id is None:
             return False
         log.info("session_stopping", extra={"session_id": self._active_session_id})
-        await self._events.put(SessionEvent(
-            type=SessionEventType.SESSION_ENDED,
-            data={"reason": "leave_requested"},
-        ))
+        if emit_event:
+            await self._events.put(SessionEvent(
+                type=SessionEventType.SESSION_ENDED,
+                data={"reason": "leave_requested"},
+            ))
         await self._teardown()
         return True
 
