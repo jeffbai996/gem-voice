@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 
@@ -61,6 +62,16 @@ class Session:
         self._events: asyncio.Queue[SessionEvent] = asyncio.Queue()
         # Inbound opus frames from parent — fed via push_opus(), drained by _decode_loop.
         self._opus_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        # Cost guardrails for the Live API (billed per-second of audio in +
+        # per-token out). A forgotten session burns money until something
+        # explicitly stops it. Two timers:
+        #   - idle: if no opus frame arrives for IDLE_TIMEOUT_S, end session
+        #     (parent process likely died, network flapped, etc.)
+        #   - hard: end session unconditionally after HARD_MAX_DURATION_S
+        # Overrides via env. _last_opus_at gets bumped in push_opus().
+        self._last_opus_at: float = time.time()
+        self._idle_timeout_s = int(os.environ.get("GEM_VOICE_IDLE_TIMEOUT_S", "300"))   # 5 min
+        self._hard_max_s = int(os.environ.get("GEM_VOICE_MAX_DURATION_S", "1800"))      # 30 min
 
     @property
     def events(self) -> asyncio.Queue:
@@ -81,6 +92,7 @@ class Session:
         """
         if self._active_session_id is None:
             return
+        self._last_opus_at = time.time()
         try:
             self._opus_in.put_nowait(frame)
         except asyncio.QueueFull:
@@ -113,6 +125,8 @@ class Session:
 
         sess_id = f"sess-{uuid.uuid4().hex[:8]}"
         self._active_session_id = sess_id
+        self._last_opus_at = time.time()
+        session_start_wall = time.time()
 
         # Drain the residual opus_in queue from any previous session.
         while not self._opus_in.empty():
@@ -128,10 +142,57 @@ class Session:
             asyncio.create_task(self._decode_loop(self._opus_in, pcm_in)),
             asyncio.create_task(self._gemini.stream(pcm_in, pcm_out, self._events)),
             asyncio.create_task(self._encode_loop(pcm_out)),
+            asyncio.create_task(self._timeout_watchdog(sess_id, session_start_wall)),
         ]
 
-        log.info("session_started", extra={"session_id": sess_id})
+        log.info(
+            "session_started",
+            extra={
+                "session_id": sess_id,
+                "idle_timeout_s": self._idle_timeout_s,
+                "hard_max_s": self._hard_max_s,
+            },
+        )
         return sess_id
+
+    async def _timeout_watchdog(self, sess_id: str, started_at: float) -> None:
+        """End the session if it idles too long or runs past the hard cap.
+
+        Both timeouts are cost guardrails — the Live API bills per-second of
+        audio. A forgotten or flapping session can quietly rack up cost. The
+        watchdog polls once per second; on trigger it puts a SESSION_ENDED
+        event with a reason and calls stop().
+        """
+        try:
+            while self._active_session_id == sess_id:
+                await asyncio.sleep(1.0)
+                if self._active_session_id != sess_id:
+                    return
+                now = time.time()
+                if now - started_at >= self._hard_max_s:
+                    log.warning(
+                        "session_hard_cap_reached",
+                        extra={"session_id": sess_id, "duration_s": int(now - started_at)},
+                    )
+                    await self._events.put(SessionEvent(
+                        type=SessionEventType.SESSION_ENDED,
+                        data={"reason": "hard_max_duration", "duration_s": int(now - started_at)},
+                    ))
+                    await self._teardown()
+                    return
+                if now - self._last_opus_at >= self._idle_timeout_s:
+                    log.warning(
+                        "session_idle_timeout",
+                        extra={"session_id": sess_id, "idle_s": int(now - self._last_opus_at)},
+                    )
+                    await self._events.put(SessionEvent(
+                        type=SessionEventType.SESSION_ENDED,
+                        data={"reason": "idle_timeout", "idle_s": int(now - self._last_opus_at)},
+                    ))
+                    await self._teardown()
+                    return
+        except asyncio.CancelledError:
+            pass
 
     async def stop(self, emit_event: bool = False) -> bool:
         if self._active_session_id is None:
