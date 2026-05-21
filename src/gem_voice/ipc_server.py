@@ -22,7 +22,6 @@ from gem_voice.types import (
     Persona,
     SessionEvent,
     SessionStatus,
-    VoiceCredentials,
 )
 
 log = logging.getLogger(__name__)
@@ -31,13 +30,13 @@ log = logging.getLogger(__name__)
 class _SessionManagerProto(Protocol):
     async def start(
         self,
-        vc_credentials: VoiceCredentials,
         persona: Persona,
         model_config: ModelConfig,
         owner_user_id: str,
     ) -> str: ...
     async def stop(self) -> bool: ...
     def status(self) -> SessionStatus: ...
+    def push_opus(self, frame: bytes) -> None: ...
     @property
     def events(self) -> asyncio.Queue: ...
 
@@ -118,11 +117,12 @@ class IpcServer:
             return await self._handle_leave(req_id)
         if action == "status":
             return self._handle_status(req_id)
+        if action == "audio_in":
+            return self._handle_audio_in(req_id, msg)
         return {"id": req_id, "ok": False, "error": f"unknown action: {action!r}"}
 
     async def _handle_join(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
         try:
-            vc = VoiceCredentials(**msg["vc_credentials"])
             persona = Persona(**msg["persona"])
             model_config = ModelConfig(**msg.get("model_config", {}))
             owner_user_id = msg["owner_user_id"]
@@ -130,10 +130,26 @@ class IpcServer:
             return {"id": req_id, "ok": False, "error": f"bad join payload: {e}"}
 
         try:
-            session_id = await self.sm.start(vc, persona, model_config, owner_user_id)
+            session_id = await self.sm.start(persona, model_config, owner_user_id)
         except RuntimeError as e:
             return {"id": req_id, "ok": False, "error": str(e)}
         return {"id": req_id, "ok": True, "session_id": session_id}
+
+    def _handle_audio_in(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
+        """Inbound Opus frame from parent. base64-encoded in msg['b64']."""
+        import base64
+        b64 = msg.get("b64")
+        if not isinstance(b64, str):
+            return {"id": req_id, "ok": False, "error": "audio_in requires 'b64' string"}
+        try:
+            opus = base64.b64decode(b64)
+        except (ValueError, TypeError) as e:
+            return {"id": req_id, "ok": False, "error": f"bad b64: {e}"}
+        self.sm.push_opus(opus)
+        # Don't bother acking each audio_in; that's per-frame chatter. Parent
+        # doesn't wait for an ack. Return a minimal ok response anyway so the
+        # NDJSON parser stays happy if the parent ever does listen.
+        return {"id": req_id, "ok": True}
 
     async def _handle_leave(self, req_id: str) -> dict[str, Any]:
         was_active = await self.sm.stop()
@@ -147,7 +163,6 @@ class IpcServer:
             "active_session": s.active_session,
             "uptime_s": s.uptime_s,
             "gemini_connected": s.gemini_connected,
-            "voice_connected": s.voice_connected,
         }
 
     async def _broadcaster(self) -> None:

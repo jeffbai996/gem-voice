@@ -3,7 +3,6 @@ import pytest
 
 from gem_voice.types import (
     Config,
-    VoiceCredentials,
     Persona,
     ModelConfig,
     SessionEvent,
@@ -26,19 +25,6 @@ def test_config_required_fields_only():
     assert c.ipc_socket_path is None
     assert c.memory_store_url is None
     assert c.memory_store_timeout_s == 2.0
-
-
-def test_voice_credentials_all_fields():
-    creds = VoiceCredentials(
-        guild_id="g1",
-        channel_id="c1",
-        user_id="u1",
-        session_id="s1",
-        endpoint="example.discord.media:443",
-        token="vc-token-abc",
-    )
-    assert creds.guild_id == "g1"
-    assert creds.endpoint == "example.discord.media:443"
 
 
 def test_persona_with_optional_memory_query():
@@ -81,7 +67,13 @@ def test_session_status_idle():
         active_session=None,
         uptime_s=10,
         gemini_connected=False,
-        voice_connected=False,
     )
     assert s.active_session is None
     assert s.uptime_s == 10
+
+
+def test_audio_out_event_type():
+    """Verify the new AUDIO_OUT event type for streaming model audio to parent."""
+    e = SessionEvent(type=SessionEventType.AUDIO_OUT, data={"b64": "AAAA"})
+    d = e.to_dict()
+    assert d == {"event": "audio_out", "b64": "AAAA"}

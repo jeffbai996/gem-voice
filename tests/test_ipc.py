@@ -30,9 +30,8 @@ class _FakeSessionManager:
         self._active = None
         self._events: asyncio.Queue = asyncio.Queue()
 
-    async def start(self, vc_credentials, persona, model_config, owner_user_id):
+    async def start(self, persona, model_config, owner_user_id):
         self.join_called_with = {
-            "vc_credentials": vc_credentials,
             "persona": persona,
             "model_config": model_config,
             "owner_user_id": owner_user_id,
@@ -51,8 +50,11 @@ class _FakeSessionManager:
             active_session=self._active,
             uptime_s=42,
             gemini_connected=self._active is not None,
-            voice_connected=self._active is not None,
         )
+
+    def push_opus(self, frame: bytes) -> None:
+        self.pushed_opus = getattr(self, 'pushed_opus', [])
+        self.pushed_opus.append(frame)
 
     @property
     def events(self) -> asyncio.Queue:
@@ -79,10 +81,6 @@ async def test_join_dispatches_to_session_manager(short_sock_path):
         resp = await _send_recv(sock, {
             "id": "req-1",
             "action": "join",
-            "vc_credentials": {
-                "guild_id": "g", "channel_id": "c", "user_id": "u",
-                "session_id": "s", "endpoint": "e:443", "token": "t",
-            },
             "owner_user_id": "owner",
             "persona": {"name": "P", "system_prompt": "be P"},
             "model_config": {"model": "m", "voice": "v", "language": "en-US"},
@@ -194,6 +192,38 @@ async def test_events_pushed_to_connected_client(short_sock_path):
 
         writer.close()
         await writer.wait_closed()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_audio_in_pushes_opus_to_session(short_sock_path):
+    """audio_in action decodes b64 and forwards bytes to session.push_opus."""
+    import base64
+    sock = short_sock_path
+    sm = _FakeSessionManager()
+    server = IpcServer(socket_path=sock, session_manager=sm)
+    await server.start()
+    try:
+        opus_bytes = b"\xde\xad\xbe\xef"
+        b64 = base64.b64encode(opus_bytes).decode("ascii")
+        resp = await _send_recv(sock, {"id": "au-1", "action": "audio_in", "b64": b64})
+        assert resp["ok"] is True
+        assert sm.pushed_opus == [opus_bytes]
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_audio_in_rejects_missing_b64(short_sock_path):
+    sock = short_sock_path
+    sm = _FakeSessionManager()
+    server = IpcServer(socket_path=sock, session_manager=sm)
+    await server.start()
+    try:
+        resp = await _send_recv(sock, {"id": "au-2", "action": "audio_in"})
+        assert resp["ok"] is False
+        assert "b64" in resp["error"]
     finally:
         await server.stop()
 

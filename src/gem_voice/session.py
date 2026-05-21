@@ -1,8 +1,18 @@
 """Session manager — the integrator.
 
-Wires VoiceClient, audio pipeline, and GeminiLiveSession into one lifecycle.
-Holds exactly one active session in v0.1. Exposes start/stop/status and an
-asyncio Queue of SessionEvents that the IPC server pushes to the parent.
+Wires the audio pipeline and GeminiLiveSession into one lifecycle. Holds
+exactly one active session in v0.2.
+
+v0.2 architecture shift: gem-voice no longer talks to Discord's voice
+gateway. The parent bot owns that connection (via discord.js / @discordjs/voice
+or similar) and streams raw 48kHz Opus frames in over IPC. We decode,
+forward to Gemini Live, encode the model's response back to Opus, and
+emit it to the parent over the same IPC.
+
+Reasons for the shift: discord.py's voice client requires too much main-gateway
+context to drive from arbitrary credentials. @discordjs/voice and similar
+Node-side libraries are designed for exactly this use case and are far more
+mature.
 """
 from __future__ import annotations
 
@@ -26,19 +36,13 @@ from gem_voice.types import (
     SessionEvent,
     SessionEventType,
     SessionStatus,
-    VoiceCredentials,
 )
-from gem_voice.voice_client import VoiceClient
 
 log = logging.getLogger(__name__)
 
 
 class SessionAlreadyActiveError(RuntimeError):
     pass
-
-
-def _make_voice_client() -> VoiceClient:
-    return VoiceClient()
 
 
 def _make_gemini_session(api_key: str) -> GeminiLiveSession:
@@ -52,10 +56,11 @@ class Session:
         self._config = config
         self._started_at = time.time()
         self._active_session_id: str | None = None
-        self._voice: VoiceClient | None = None
         self._gemini: GeminiLiveSession | None = None
         self._tasks: list[asyncio.Task] = []
         self._events: asyncio.Queue[SessionEvent] = asyncio.Queue()
+        # Inbound opus frames from parent — fed via push_opus(), drained by _decode_loop.
+        self._opus_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
 
     @property
     def events(self) -> asyncio.Queue:
@@ -66,12 +71,28 @@ class Session:
             active_session=self._active_session_id,
             uptime_s=int(time.time() - self._started_at),
             gemini_connected=self._gemini is not None,
-            voice_connected=self._voice is not None,
         )
+
+    def push_opus(self, frame: bytes) -> None:
+        """Feed one 48kHz mono Opus packet from the parent into the pipeline.
+
+        Synchronous + non-blocking. Drops oldest frame on queue overflow to keep
+        the model fed with the freshest audio (latency > completeness).
+        """
+        if self._active_session_id is None:
+            return
+        try:
+            self._opus_in.put_nowait(frame)
+        except asyncio.QueueFull:
+            try:
+                self._opus_in.get_nowait()
+                self._opus_in.put_nowait(frame)
+                log.warning("opus_in_overflow_drop_oldest")
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
 
     async def start(
         self,
-        vc_credentials: VoiceCredentials,
         persona: Persona,
         model_config: ModelConfig,
         owner_user_id: str,
@@ -81,11 +102,9 @@ class Session:
 
         composed_persona = await self._compose_persona(persona)
 
-        self._voice = _make_voice_client()
         self._gemini = _make_gemini_session(self._config.gemini_api_key)
 
         try:
-            await self._voice.connect(vc_credentials)
             await self._gemini.connect(composed_persona, model_config)
         except Exception as e:
             log.error("session_start_failed", extra={"error": str(e)})
@@ -95,32 +114,26 @@ class Session:
         sess_id = f"sess-{uuid.uuid4().hex[:8]}"
         self._active_session_id = sess_id
 
-        opus_in: asyncio.Queue = asyncio.Queue(maxsize=200)
-        pcm_in: asyncio.Queue = asyncio.Queue(maxsize=200)
-        pcm_out: asyncio.Queue = asyncio.Queue(maxsize=200)
-        opus_out: asyncio.Queue = asyncio.Queue(maxsize=200)
+        # Drain the residual opus_in queue from any previous session.
+        while not self._opus_in.empty():
+            try:
+                self._opus_in.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
-        summoner_ssrc = int(vc_credentials.user_id) if vc_credentials.user_id.isdigit() else 0
+        pcm_in: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
+        pcm_out: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+
         self._tasks = [
-            asyncio.create_task(self._voice.recv_loop(opus_in, summoner_ssrc=summoner_ssrc)),
-            asyncio.create_task(self._decode_loop(opus_in, pcm_in)),
+            asyncio.create_task(self._decode_loop(self._opus_in, pcm_in)),
             asyncio.create_task(self._gemini.stream(pcm_in, pcm_out, self._events)),
-            asyncio.create_task(self._encode_loop(pcm_out, opus_out)),
-            asyncio.create_task(self._voice.send_loop(opus_out)),
+            asyncio.create_task(self._encode_loop(pcm_out)),
         ]
 
         log.info("session_started", extra={"session_id": sess_id})
         return sess_id
 
     async def stop(self, emit_event: bool = False) -> bool:
-        """Stop the active session. Returns True if there was one to stop.
-
-        emit_event: if True, push a SESSION_ENDED event before teardown. Set
-        when the session ends for a reason the parent didn't initiate (vc
-        disconnect, model error). Leave False when the parent explicitly
-        called 'leave' — they already know the session ended, and racing
-        the event against the leave ack causes ordering bugs.
-        """
         if self._active_session_id is None:
             return False
         log.info("session_stopping", extra={"session_id": self._active_session_id})
@@ -141,17 +154,11 @@ class Session:
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks = []
-        if self._voice is not None:
-            try:
-                await self._voice.disconnect()
-            except Exception:
-                pass
         if self._gemini is not None:
             try:
                 await self._gemini.close()
             except Exception:
                 pass
-        self._voice = None
         self._gemini = None
         self._active_session_id = None
 
@@ -195,9 +202,9 @@ class Session:
     async def _encode_loop(
         self,
         pcm_out: asyncio.Queue,
-        opus_out: asyncio.Queue,
     ) -> None:
-        """PCM 24kHz → Opus 48kHz. Slice into 20ms frames."""
+        """PCM 24kHz from model → Opus 48kHz frames → emit as AUDIO_OUT events."""
+        import base64
         encoder = OpusEncoder()
         frame_size = 1920  # 20ms at 48kHz int16 mono
         while True:
@@ -212,4 +219,7 @@ class Session:
                     break
                 opus = encoder.encode(frame)
                 if opus:
-                    await opus_out.put(opus)
+                    await self._events.put(SessionEvent(
+                        type=SessionEventType.AUDIO_OUT,
+                        data={"b64": base64.b64encode(opus).decode("ascii")},
+                    ))

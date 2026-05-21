@@ -25,22 +25,6 @@ class Config:
 
 
 @dataclass(frozen=True)
-class VoiceCredentials:
-    """Per-call Discord voice credentials handed in by the parent bot via IPC.
-
-    Parent obtains these from VOICE_STATE_UPDATE + VOICE_SERVER_UPDATE on its
-    main gateway connection, then passes them to gem-voice. gem-voice never
-    sees the bot token — only these per-call credentials.
-    """
-    guild_id: str
-    channel_id: str
-    user_id: str          # bot user id (parent's identity)
-    session_id: str       # from VOICE_STATE_UPDATE
-    endpoint: str         # from VOICE_SERVER_UPDATE
-    token: str            # voice-call token, NOT the bot token
-
-
-@dataclass(frozen=True)
 class Persona:
     """Per-call persona definition. Comes from parent over IPC."""
     name: str
@@ -63,6 +47,9 @@ class SessionEventType(str, Enum):
     MODEL_SPEECH_END = "model_speech_end"
     SESSION_ENDED = "session_ended"
     ERROR = "error"
+    # Audio frames flowing back to parent (model speech). Each event carries
+    # a base64-encoded 48kHz mono Opus packet in data['b64'].
+    AUDIO_OUT = "audio_out"
 
 
 @dataclass(frozen=True)
@@ -83,4 +70,3 @@ class SessionStatus:
     active_session: str | None
     uptime_s: int
     gemini_connected: bool
-    voice_connected: bool
