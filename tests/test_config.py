@@ -5,6 +5,17 @@ from gem_voice.config import load_config, ConfigError
 from gem_voice.types import Config
 
 
+@pytest.fixture(autouse=True)
+def _no_dotenv(monkeypatch):
+    """Don't let load_dotenv() reach into the real .env during tests.
+
+    Without this, running tests in a deployed checkout (which has a real .env)
+    silently overrides monkeypatch.delenv() calls — required-missing tests
+    would then unexpectedly pass.
+    """
+    monkeypatch.setattr("gem_voice.config.load_dotenv", lambda *a, **kw: False)
+
+
 def _clear_all_env(monkeypatch):
     for k in (
         "GEMINI_API_KEY", "DISCORD_OWNER_USER_ID",
