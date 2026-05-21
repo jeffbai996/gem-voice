@@ -39,6 +39,20 @@ python -m gem_voice
 
 The daemon listens on a unix socket (default `$XDG_RUNTIME_DIR/gem-voice.sock`, fallback `/tmp/gem-voice.sock`). Override with `IPC_SOCKET_PATH` in `.env`.
 
+### Session cost guardrails
+
+The Gemini Live API bills per-second of audio in plus per-token out, so a
+forgotten session quietly racks up cost. Two timeouts cap session
+lifetime; both emit a `SESSION_ENDED` event with a `reason` field when
+they fire (`idle_timeout` or `hard_max_duration`):
+
+- `GEM_VOICE_IDLE_TIMEOUT_S` — end session after no opus frame received
+  for this long (default `300`, i.e. 5 minutes). Catches dead parent
+  processes and network flaps.
+- `GEM_VOICE_MAX_DURATION_S` — hard ceiling on session length regardless
+  of activity (default `1800`, i.e. 30 minutes). Backstop against
+  unexpectedly long sessions.
+
 ## IPC protocol
 
 Newline-delimited JSON over unix socket. Three commands:
