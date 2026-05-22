@@ -9,23 +9,36 @@ from gem_voice.types import ModelConfig, Persona, SessionEvent
 
 
 class _FakeLiveSession:
-    """Stand-in for genai.aio.live session. Records sent audio, replays canned events."""
+    """Stand-in for genai.aio.live session. Records sent audio, replays canned events.
+
+    The wrapper calls receive() in a `while True` loop (one iterator per turn),
+    so the first call yields the canned replay, and every subsequent call
+    waits forever — mimicking "session open, no more model turns yet". The
+    recv task gets cancelled by the wrapper when the send-side hits its stop
+    sentinel.
+    """
 
     def __init__(self, replay=None):
         self.sent = []
         self._replay = replay or []
         self.closed = False
+        self._turns_consumed = 0
 
     async def send_realtime_input(self, audio=None, media=None, **kwargs):
-        # Record whichever blob was passed; the wrapper switched to media=
-        # per the SDK's documented example, but the fake accepts both.
+        # Accept either kwarg shape; the working example uses audio=.
         blob = media if media is not None else audio
         if blob is not None:
             self.sent.append(blob)
 
     async def receive(self):
-        for item in self._replay:
-            yield item
+        if self._turns_consumed == 0:
+            self._turns_consumed += 1
+            for item in self._replay:
+                yield item
+        else:
+            # No more turns; block until cancelled.
+            await asyncio.Event().wait()
+            yield  # unreachable, satisfies async-generator shape
 
     async def close(self):
         self.closed = True
@@ -77,10 +90,20 @@ async def test_connect_passes_persona_and_model(monkeypatch):
 @pytest.mark.asyncio
 async def test_stream_forwards_pcm_in_and_collects_pcm_out(monkeypatch):
     fake_session = _FakeLiveSession(replay=[
-        MagicMock(server_content=MagicMock(model_turn=MagicMock(parts=[
-            MagicMock(inline_data=MagicMock(data=b"\xaa" * 100, mime_type="audio/pcm"))
-        ]))),
-        MagicMock(server_content=MagicMock(turn_complete=True, model_turn=None)),
+        MagicMock(server_content=MagicMock(
+            model_turn=MagicMock(parts=[
+                MagicMock(inline_data=MagicMock(data=b"\xaa" * 100, mime_type="audio/pcm"))
+            ]),
+            input_transcription=None,
+            output_transcription=None,
+            turn_complete=False,
+        )),
+        MagicMock(server_content=MagicMock(
+            turn_complete=True,
+            model_turn=None,
+            input_transcription=None,
+            output_transcription=None,
+        )),
     ])
 
     monkeypatch.setattr(

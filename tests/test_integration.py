@@ -140,8 +140,8 @@ async def test_full_join_audio_roundtrip(short_sock_path, base_config, monkeypat
 
         await asyncio.sleep(0.05)
 
-        # 2. Send Opus frames via audio_in. Use real Opus packets that decode
-        # to speech-loud PCM so VAD passes them through.
+        # 2. Send Opus frames via audio_in. Use real Opus packets so the
+        # decode/resample pipeline gets a realistic input.
         from pathlib import Path
         from gem_voice.audio import OpusEncoder, resample_pcm16
         sine_16k = (Path(__file__).parent / "fixtures" / "sine_440hz_16k_1s.pcm").read_bytes()
