@@ -16,9 +16,12 @@ class _FakeLiveSession:
         self._replay = replay or []
         self.closed = False
 
-    async def send_realtime_input(self, audio=None, **kwargs):
-        if audio is not None:
-            self.sent.append(audio)
+    async def send_realtime_input(self, audio=None, media=None, **kwargs):
+        # Record whichever blob was passed; the wrapper switched to media=
+        # per the SDK's documented example, but the fake accepts both.
+        blob = media if media is not None else audio
+        if blob is not None:
+            self.sent.append(blob)
 
     async def receive(self):
         for item in self._replay:

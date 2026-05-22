@@ -76,16 +76,23 @@ class GeminiLiveSession:
             raise RuntimeError("connect() must be called before stream()")
 
         async def _send_loop():
+            frame_count = 0
             while True:
                 frame = await pcm_in.get()
                 if frame is None:
+                    log.info("gemini_send_stopped", extra={"frames_sent": frame_count})
                     return
                 try:
                     await self._session.send_realtime_input(
-                        audio=genai_types.Blob(data=frame, mime_type="audio/pcm;rate=16000")
+                        media=genai_types.Blob(data=frame, mime_type="audio/pcm;rate=16000")
                     )
+                    frame_count += 1
+                    if frame_count == 1 or frame_count % 100 == 0:
+                        log.info("gemini_send_progress",
+                                 extra={"frames_sent": frame_count, "frame_bytes": len(frame)})
                 except Exception as e:
-                    log.warning("gemini_send_failed", extra={"error": str(e)})
+                    log.warning("gemini_send_failed",
+                                extra={"error": str(e), "frames_sent": frame_count})
                     await events.put(SessionEvent(
                         type=SessionEventType.ERROR,
                         data={"fatal": False, "message": f"gemini send failed: {e}"},
@@ -93,24 +100,43 @@ class GeminiLiveSession:
                     return
 
         async def _recv_loop():
+            msg_count = 0
+            audio_chunk_count = 0
             try:
                 async for response in self._session.receive():
+                    msg_count += 1
                     server_content = getattr(response, "server_content", None)
                     if server_content is None:
+                        # Sample-log unusual responses so we can see what we're
+                        # getting from Gemini Live when things look wrong.
+                        if msg_count <= 5:
+                            log.info("gemini_recv_no_server_content",
+                                     extra={"msg_count": msg_count,
+                                            "response_attrs": [a for a in dir(response) if not a.startswith("_")][:10]})
                         continue
                     model_turn = getattr(server_content, "model_turn", None)
                     if model_turn is not None:
                         for part in getattr(model_turn, "parts", []) or []:
                             inline = getattr(part, "inline_data", None)
                             if inline is not None and getattr(inline, "data", None):
+                                audio_chunk_count += 1
+                                if audio_chunk_count <= 3:
+                                    log.info("gemini_audio_chunk",
+                                             extra={"chunk_n": audio_chunk_count,
+                                                    "bytes": len(inline.data),
+                                                    "mime": getattr(inline, "mime_type", None)})
                                 await pcm_out.put(inline.data)
                     if getattr(server_content, "turn_complete", False):
+                        log.info("gemini_turn_complete",
+                                 extra={"msgs": msg_count, "audio_chunks": audio_chunk_count})
                         await events.put(SessionEvent(
                             type=SessionEventType.MODEL_SPEECH_END,
                             data={},
                         ))
             except Exception as e:
-                log.warning("gemini_recv_failed", extra={"error": str(e)})
+                log.warning("gemini_recv_failed",
+                            extra={"error": str(e), "msgs_received": msg_count,
+                                   "audio_chunks": audio_chunk_count})
                 await events.put(SessionEvent(
                     type=SessionEventType.ERROR,
                     data={"fatal": True, "message": f"gemini recv failed: {e}"},
