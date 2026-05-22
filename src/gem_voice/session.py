@@ -25,7 +25,6 @@ import uuid
 from gem_voice.audio import (
     OpusDecoder,
     OpusEncoder,
-    VAD,
     resample_pcm16,
 )
 from gem_voice.gemini_live import GeminiLiveSession
@@ -246,9 +245,16 @@ class Session:
         opus_in: asyncio.Queue,
         pcm_in: asyncio.Queue,
     ) -> None:
-        """Opus 48kHz → PCM 16kHz mono int16. Apply VAD."""
+        """Opus 48kHz → PCM 16kHz mono int16. Pass everything through.
+
+        We deliberately do NOT run a local VAD here. Gemini Live performs its
+        own server-side VAD on the continuous audio stream — a redundant local
+        VAD silently dropped every frame when the threshold was wrong for the
+        actual mic level, and showed up as "frames flowing in over IPC but
+        zero send_progress logs on the Gemini side" (the May 21 symptom).
+        """
         decoder = OpusDecoder()
-        vad = VAD(threshold_rms=500)
+        frame_count = 0
         while True:
             try:
                 opus = await opus_in.get()
@@ -256,8 +262,11 @@ class Session:
                 return
             pcm_48k = decoder.decode(opus)
             pcm_16k = resample_pcm16(pcm_48k, src_rate=48000, dst_rate=16000)
-            if not vad.is_speech(pcm_16k):
-                continue
+            frame_count += 1
+            if frame_count == 1 or frame_count % 100 == 0:
+                log.info("decode_loop_progress",
+                         extra={"frames_decoded": frame_count,
+                                "pcm16k_bytes": len(pcm_16k)})
             await pcm_in.put(pcm_16k)
 
     async def _encode_loop(
