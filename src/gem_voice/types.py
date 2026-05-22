@@ -15,7 +15,7 @@ class Config:
     """Daemon-wide configuration, loaded once from env at startup."""
     gemini_api_key: str
     discord_owner_user_id: str
-    gemini_model: str = "gemini-3.1-flash-live-preview"
+    gemini_model: str = "gemini-live-2.5-flash-preview"
     gemini_voice: str = "Aoede"
     gemini_language: str = "en-US"
     log_level: str = "INFO"
@@ -35,7 +35,7 @@ class Persona:
 @dataclass(frozen=True)
 class ModelConfig:
     """Per-call model selection. Defaults match Config defaults."""
-    model: str = "gemini-3.1-flash-live-preview"
+    model: str = "gemini-live-2.5-flash-preview"
     voice: str = "Aoede"
     language: str = "en-US"
 

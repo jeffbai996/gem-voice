@@ -35,7 +35,7 @@ def test_load_with_required_only(monkeypatch):
     assert isinstance(c, Config)
     assert c.gemini_api_key == "key-abc"
     assert c.discord_owner_user_id == "user-xyz"
-    assert c.gemini_model == "gemini-3.1-flash-live-preview"
+    assert c.gemini_model == "gemini-live-2.5-flash-preview"
     assert c.log_level == "INFO"
     assert c.ipc_socket_path is None
     assert c.memory_store_url is None

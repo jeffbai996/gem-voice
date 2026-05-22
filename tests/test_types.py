@@ -18,7 +18,7 @@ def test_config_required_fields_only():
     )
     assert c.gemini_api_key == "key123"
     assert c.discord_owner_user_id == "user456"
-    assert c.gemini_model == "gemini-3.1-flash-live-preview"
+    assert c.gemini_model == "gemini-live-2.5-flash-preview"
     assert c.gemini_voice == "Aoede"
     assert c.gemini_language == "en-US"
     assert c.log_level == "INFO"
@@ -39,7 +39,7 @@ def test_persona_with_optional_memory_query():
 
 def test_model_config_defaults():
     m = ModelConfig()
-    assert m.model == "gemini-3.1-flash-live-preview"
+    assert m.model == "gemini-live-2.5-flash-preview"
     assert m.voice == "Aoede"
     assert m.language == "en-US"
 
