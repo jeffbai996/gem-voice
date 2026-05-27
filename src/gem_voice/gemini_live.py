@@ -99,7 +99,11 @@ class GeminiLiveSession:
                         audio=genai_types.Blob(data=frame, mime_type="audio/pcm;rate=16000")
                     )
                     frame_count += 1
-                    if frame_count == 1 or frame_count % 100 == 0:
+                    # Was every 100 frames (~16k lines per 10-min session) — far
+                    # too chatty. Widen to every 1000 so progress is still
+                    # visible without drowning the logs. Keep the frame-1 line as
+                    # the "stream is alive" signal.
+                    if frame_count == 1 or frame_count % 1000 == 0:
                         log.info("gemini_send_progress",
                                  extra={"frames_sent": frame_count, "frame_bytes": len(frame)})
                 except Exception as e:
