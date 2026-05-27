@@ -69,6 +69,11 @@ class Session:
         #   - hard: end session unconditionally after HARD_MAX_DURATION_S
         # Overrides via env. _last_opus_at gets bumped in push_opus().
         self._last_opus_at: float = time.time()
+        # Cumulative count of opus frames dropped on queue overflow. Without
+        # this, a saturated pipeline silently sheds audio and the only signal
+        # is a context-free WARNING — you can't tell one hiccup from sustained
+        # loss. Logged as a running total each time a drop happens.
+        self._opus_dropped: int = 0
         self._idle_timeout_s = int(os.environ.get("GEM_VOICE_IDLE_TIMEOUT_S", "300"))   # 5 min
         self._hard_max_s = int(os.environ.get("GEM_VOICE_MAX_DURATION_S", "1800"))      # 30 min
 
@@ -98,7 +103,9 @@ class Session:
             try:
                 self._opus_in.get_nowait()
                 self._opus_in.put_nowait(frame)
-                log.warning("opus_in_overflow_drop_oldest")
+                self._opus_dropped += 1
+                log.warning("opus_in_overflow_drop_oldest",
+                            extra={"dropped_total": self._opus_dropped})
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
 
