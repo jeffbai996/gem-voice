@@ -20,3 +20,6 @@ htmlcov/
 *.egg-info/
 build/
 dist/
+
+# secrets-bearing backups (never commit)
+.env.bak*
