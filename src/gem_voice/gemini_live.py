@@ -172,7 +172,7 @@ class GeminiLiveSession:
                         if isinstance(fcs, list) and fcs:
                             for fc in fcs:
                                 log.info("gemini_tool_call",
-                                         extra={"name": fc.name,
+                                         extra={"tool_name": fc.name,
                                                 "call_id": fc.id})
                                 await events.put(SessionEvent(
                                     type=SessionEventType.TOOL_CALL,
@@ -292,7 +292,7 @@ class GeminiLiveSession:
             function_responses=[genai_types.FunctionResponse(
                 id=call_id, name=name, response=response)])
         log.info("gemini_tool_response_sent",
-                 extra={"name": name, "call_id": call_id})
+                 extra={"tool_name": name, "call_id": call_id})
 
     async def close(self) -> None:
         if not self._connected:
