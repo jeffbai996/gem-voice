@@ -167,6 +167,7 @@ class IpcServer:
 
     async def _broadcaster(self) -> None:
         """Pull events from session manager and push to the active client."""
+        audio_out_sent = 0
         while True:
             try:
                 event: SessionEvent = await self.sm.events.get()
@@ -174,10 +175,17 @@ class IpcServer:
                 return
             writer = self._active_writer
             if writer is None:
+                if event.type.value == "audio_out":
+                    log.warning("audio_out_dropped_no_client")
                 continue
             try:
                 writer.write((json.dumps(event.to_dict()) + "\n").encode())
                 await writer.drain()
+                if event.type.value == "audio_out":
+                    audio_out_sent += 1
+                    if audio_out_sent == 1 or audio_out_sent % 100 == 0:
+                        log.info("audio_out_broadcast",
+                                 extra={"frames_sent": audio_out_sent})
             except (ConnectionResetError, BrokenPipeError) as e:
                 log.warning("ipc_broadcast_failed", extra={"error": str(e)})
                 self._active_writer = None

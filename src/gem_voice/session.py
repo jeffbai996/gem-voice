@@ -314,18 +314,28 @@ class Session:
         import base64
         encoder = OpusEncoder()
         frame_size = 1920  # 20ms at 48kHz int16 mono
+        emitted = 0
+        leftover = b""  # PCM remainder carried between model chunks —
+        # chunk boundaries don't align to 20ms frames, and dropping the
+        # tail of every chunk shaves audible slivers off the speech
         while True:
             try:
                 pcm_24k = await pcm_out.get()
             except asyncio.CancelledError:
                 return
-            pcm_48k = resample_pcm16(pcm_24k, src_rate=24000, dst_rate=48000)
-            for i in range(0, len(pcm_48k), frame_size):
+            pcm_48k = leftover + resample_pcm16(
+                pcm_24k, src_rate=24000, dst_rate=48000)
+            usable = len(pcm_48k) - (len(pcm_48k) % frame_size)
+            leftover = pcm_48k[usable:]
+            for i in range(0, usable, frame_size):
                 frame = pcm_48k[i:i + frame_size]
-                if len(frame) < frame_size:
-                    break
                 opus = encoder.encode(frame)
                 if opus:
+                    emitted += 1
+                    if emitted == 1 or emitted % 100 == 0:
+                        log.info("encode_loop_progress",
+                                 extra={"opus_frames_emitted": emitted,
+                                        "opus_bytes": len(opus)})
                     await self._events.put(SessionEvent(
                         type=SessionEventType.AUDIO_OUT,
                         data={"b64": base64.b64encode(opus).decode("ascii")},
