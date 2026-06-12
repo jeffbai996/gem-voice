@@ -21,6 +21,7 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import replace
 
 from gem_voice.audio import (
     OpusDecoder,
@@ -117,6 +118,16 @@ class Session:
     ) -> str:
         if self._active_session_id is not None:
             raise SessionAlreadyActiveError("session already active")
+
+        # The IPC join payload from the Node side may omit the model (or carry
+        # ModelConfig's stale dataclass default, which is a since-deprecated
+        # Live model id). The daemon — not the caller — owns its model: fall
+        # back to GEMINI_MODEL from config whenever the caller didn't send a
+        # real override. Without this, every join used the dead default and
+        # Gemini rejected the connection with a 1008 "model not found".
+        if not model_config.model or model_config.model == ModelConfig().model:
+            model_config = replace(model_config, model=self._config.gemini_model)
+            log.info("model_override_from_config", extra={"model": model_config.model})
 
         composed_persona = await self._compose_persona(persona)
 
