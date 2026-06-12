@@ -111,7 +111,7 @@ class Session:
             return True
         except Exception as e:  # noqa: BLE001 — surfaced to caller
             log.warning("tool_response_failed",
-                        extra={"name": name, "error": str(e)})
+                        extra={"tool_name": name, "error": str(e)})
             return False
 
     def push_opus(self, frame: bytes) -> None:
