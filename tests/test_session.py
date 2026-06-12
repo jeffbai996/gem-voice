@@ -87,3 +87,25 @@ async def test_push_opus_ignored_when_idle(base_config):
     s.push_opus(b"\x00\x01\x02")
     # No exception, no side effects.
     assert s.status().active_session is None
+
+
+@pytest.mark.asyncio
+async def test_compose_persona_appends_voice_override(base_config, persona):
+    """Voice calls suspend inherited text-channel silence etiquette —
+    the very first live smoke test went mute because the parent's
+    persona told the model to opt out of acknowledgments."""
+    from gem_voice.session import _VOICE_OVERRIDE
+    s = Session(base_config)
+    composed = await s._compose_persona(persona)
+    assert composed.system_prompt.startswith("be P")
+    assert _VOICE_OVERRIDE in composed.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_compose_persona_override_applies_without_memory_query(
+        base_config):
+    from gem_voice.session import _VOICE_OVERRIDE
+    s = Session(base_config)
+    p = Persona(name="P", system_prompt="be P", memory_query=None)
+    composed = await s._compose_persona(p)
+    assert _VOICE_OVERRIDE in composed.system_prompt
