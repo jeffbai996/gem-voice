@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from google import genai
@@ -85,8 +86,33 @@ class GeminiLiveSession:
 
         async def _send_loop():
             frame_count = 0
+            # Frames sent since the last audio_stream_end. Discord stops
+            # shipping opus the moment the speaker goes quiet (no comfort
+            # noise), so Gemini's server-side VAD never hears trailing
+            # silence and waits forever for the utterance to end — session
+            # alive, model mute. When the frame stream pauses longer than
+            # the gap threshold, tell Gemini the audio stream ended so it
+            # commits the turn and replies.
+            sent_since_end = 0
+            gap_s = float(os.environ.get("GEM_VOICE_UTTERANCE_GAP_S", "0.6"))
             while True:
-                frame = await pcm_in.get()
+                try:
+                    if sent_since_end:
+                        frame = await asyncio.wait_for(pcm_in.get(),
+                                                       timeout=gap_s)
+                    else:
+                        frame = await pcm_in.get()
+                except asyncio.TimeoutError:
+                    try:
+                        await self._session.send_realtime_input(
+                            audio_stream_end=True)
+                        log.info("gemini_audio_stream_end",
+                                 extra={"after_frames": sent_since_end})
+                    except Exception as e:
+                        log.warning("gemini_stream_end_failed",
+                                    extra={"error": str(e)})
+                    sent_since_end = 0
+                    continue
                 if frame is None:
                     log.info("gemini_send_stopped", extra={"frames_sent": frame_count})
                     return
@@ -99,6 +125,7 @@ class GeminiLiveSession:
                         audio=genai_types.Blob(data=frame, mime_type="audio/pcm;rate=16000")
                     )
                     frame_count += 1
+                    sent_since_end += 1
                     # Was every 100 frames (~16k lines per 10-min session) — far
                     # too chatty. Widen to every 1000 so progress is still
                     # visible without drowning the logs. Keep the frame-1 line as

@@ -41,6 +41,18 @@ from gem_voice.types import (
 
 log = logging.getLogger(__name__)
 
+# Appended to every composed persona. Live calls are conversation, not a
+# text channel — any inherited "when to stay silent" rules must not apply.
+_VOICE_OVERRIDE = (
+    "IMPORTANT — you are on a LIVE VOICE CALL right now. The rules above "
+    "about staying silent, opting out of replies, or skipping "
+    "acknowledgments apply ONLY to text channels and are suspended for "
+    "this call. On a call, silence is a malfunction: ALWAYS respond out "
+    "loud to anything the speaker says, including greetings, mic tests, "
+    "and small talk. Keep replies short, natural, and conversational — "
+    "you are speaking, not writing. No markdown, no lists, no emoji."
+)
+
 
 class SessionAlreadyActiveError(RuntimeError):
     pass
@@ -241,17 +253,24 @@ class Session:
         self._active_session_id = None
 
     async def _compose_persona(self, persona: Persona) -> Persona:
-        if not persona.memory_query:
-            return persona
-        snippets = await fetch_context(
-            query=persona.memory_query,
-            base_url=self._config.memory_store_url,
-            timeout_s=self._config.memory_store_timeout_s,
-        )
-        if not snippets:
-            return persona
-        context_block = "\n".join(f"- {s}" for s in snippets)
-        new_prompt = f"{persona.system_prompt}\n\nRelevant context:\n{context_block}"
+        new_prompt = persona.system_prompt
+        if persona.memory_query:
+            snippets = await fetch_context(
+                query=persona.memory_query,
+                base_url=self._config.memory_store_url,
+                timeout_s=self._config.memory_store_timeout_s,
+            )
+            if snippets:
+                context_block = "\n".join(f"- {s}" for s in snippets)
+                new_prompt = (f"{new_prompt}\n\n"
+                              f"Relevant context:\n{context_block}")
+        # Parent bots hand us their TEXT-channel persona, which usually
+        # carries lurking etiquette ("stay silent unless you add value",
+        # "opt out of pure acknowledgments"). On a live voice call that
+        # etiquette is a bug: the very first smoke test ("testing") made
+        # the model conclude silence was the polite reply — perfect
+        # pipeline, mute bot. Voice overrides text rules, always.
+        new_prompt = f"{new_prompt}\n\n{_VOICE_OVERRIDE}"
         return Persona(
             name=persona.name,
             system_prompt=new_prompt,
