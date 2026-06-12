@@ -46,7 +46,7 @@ def load_config() -> Config:
     return Config(
         gemini_api_key=_required("GEMINI_API_KEY"),
         discord_owner_user_id=_required("DISCORD_OWNER_USER_ID"),
-        gemini_model=_optional("GEMINI_MODEL") or "gemini-live-2.5-flash-preview",
+        gemini_model=_optional("GEMINI_MODEL") or "gemini-3.1-flash-live-preview",
         gemini_voice=_optional("GEMINI_VOICE") or "Aoede",
         gemini_language=_optional("GEMINI_LANGUAGE") or "en-US",
         log_level=_optional("LOG_LEVEL") or "INFO",

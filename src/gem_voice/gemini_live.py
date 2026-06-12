@@ -132,10 +132,22 @@ class GeminiLiveSession:
                         msg_count += 1
                         server_content = getattr(response, "server_content", None)
                         if server_content is None:
-                            if msg_count <= 5:
+                            # No content — could be setup_complete, or a goAway
+                            # (server-initiated disconnect). Dump the actual payload
+                            # so we can see WHY Gemini is hanging up instead of
+                            # talking. goAway carries a time_left/reason; a config
+                            # rejection shows here too.
+                            go_away = getattr(response, "go_away", None)
+                            setup_complete = getattr(response, "setup_complete", None)
+                            if go_away is not None:
+                                log.warning("gemini_go_away",
+                                            extra={"msg_count": msg_count,
+                                                   "go_away": repr(go_away)[:500]})
+                            elif msg_count <= 5:
                                 log.info("gemini_recv_no_server_content",
                                          extra={"msg_count": msg_count,
-                                                "response_attrs": [a for a in dir(response) if not a.startswith("_")][:10]})
+                                                "setup_complete": repr(setup_complete)[:200],
+                                                "response_repr": repr(response)[:500]})
                             continue
                         # Audio out from the model.
                         model_turn = getattr(server_content, "model_turn", None)
