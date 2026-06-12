@@ -65,7 +65,7 @@ class _FakeGeminiLive:
         self._persona = None
         self._model_config = None
 
-    async def connect(self, persona, model_config):
+    async def connect(self, persona, model_config, tools=None):
         self.connected = True
         self._persona = persona
         self._model_config = model_config

@@ -29,7 +29,8 @@ def _make_client(api_key: str):
     return genai.Client(api_key=api_key)
 
 
-def _build_live_config(persona: Persona, model_config: ModelConfig) -> Any:
+def _build_live_config(persona: Persona, model_config: ModelConfig,
+                       tools: list[dict] | None = None) -> Any:
     """Construct the LiveConnectConfig for Gemini Live.
 
     output_audio_transcription / input_audio_transcription give us text-level
@@ -37,8 +38,15 @@ def _build_live_config(persona: Persona, model_config: ModelConfig) -> Any:
     of what it heard tells us whether server-side VAD is working; the
     output transcription tells us what it tried to say.
     """
+    cfg_tools = None
+    if tools:
+        # Declarations arrive as plain dicts over IPC (the parent's
+        # FunctionDeclaration JSON) — the SDK accepts dict-shaped
+        # declarations inside a Tool wrapper.
+        cfg_tools = [genai_types.Tool(function_declarations=tools)]
     return genai_types.LiveConnectConfig(
         response_modalities=["AUDIO"],
+        tools=cfg_tools,
         system_instruction=persona.system_prompt,
         speech_config=genai_types.SpeechConfig(
             voice_config=genai_types.VoiceConfig(
@@ -63,8 +71,9 @@ class GeminiLiveSession:
         self._session = None
         self._connected = False
 
-    async def connect(self, persona: Persona, model_config: ModelConfig) -> None:
-        cfg = _build_live_config(persona, model_config)
+    async def connect(self, persona: Persona, model_config: ModelConfig,
+                      tools: list[dict] | None = None) -> None:
+        cfg = _build_live_config(persona, model_config, tools)
         self._ctx = self._client.aio.live.connect(model=model_config.model, config=cfg)
         self._session = await self._ctx.__aenter__()
         self._connected = True
@@ -157,7 +166,42 @@ class GeminiLiveSession:
                     turn = self._session.receive()
                     async for response in turn:
                         msg_count += 1
+                        tool_call = getattr(response, "tool_call", None)
+                        fcs = getattr(tool_call, "function_calls", None) \
+                            if tool_call is not None else None
+                        if isinstance(fcs, list) and fcs:
+                            for fc in fcs:
+                                log.info("gemini_tool_call",
+                                         extra={"name": fc.name,
+                                                "call_id": fc.id})
+                                await events.put(SessionEvent(
+                                    type=SessionEventType.TOOL_CALL,
+                                    data={"call_id": fc.id,
+                                          "name": fc.name,
+                                          "args": dict(fc.args or {})},
+                                ))
+                            continue
                         server_content = getattr(response, "server_content", None)
+                        if (server_content is not None
+                                and getattr(server_content, "interrupted",
+                                            None) is True):
+                            # Barge-in: the speaker talked over the model.
+                            # Gemini stops generating; everything already
+                            # emitted must die too or "interruption" just
+                            # means "she finishes the sentence anyway".
+                            drained = 0
+                            while not pcm_out.empty():
+                                try:
+                                    pcm_out.get_nowait()
+                                    drained += 1
+                                except asyncio.QueueEmpty:
+                                    break
+                            log.info("gemini_interrupted",
+                                     extra={"pcm_chunks_drained": drained})
+                            await events.put(SessionEvent(
+                                type=SessionEventType.AUDIO_FLUSH,
+                                data={},
+                            ))
                         if server_content is None:
                             # No content — could be setup_complete, or a goAway
                             # (server-initiated disconnect). Dump the actual payload
@@ -237,6 +281,18 @@ class GeminiLiveSession:
             await recv_task
         except asyncio.CancelledError:
             pass
+
+    async def send_tool_response(self, call_id: str, name: str,
+                                 response: dict) -> None:
+        """Return a function result to the live session. Gemini holds the
+        conversational turn open while waiting, then speaks the answer."""
+        if self._session is None:
+            raise RuntimeError("no live session")
+        await self._session.send_tool_response(
+            function_responses=[genai_types.FunctionResponse(
+                id=call_id, name=name, response=response)])
+        log.info("gemini_tool_response_sent",
+                 extra={"name": name, "call_id": call_id})
 
     async def close(self) -> None:
         if not self._connected:

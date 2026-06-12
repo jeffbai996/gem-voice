@@ -101,6 +101,19 @@ class Session:
             gemini_connected=self._gemini is not None,
         )
 
+    async def push_tool_response(self, call_id: str, name: str,
+                                 response: dict) -> bool:
+        """Forward a parent-executed tool result into the live session."""
+        if self._gemini is None:
+            return False
+        try:
+            await self._gemini.send_tool_response(call_id, name, response)
+            return True
+        except Exception as e:  # noqa: BLE001 — surfaced to caller
+            log.warning("tool_response_failed",
+                        extra={"name": name, "error": str(e)})
+            return False
+
     def push_opus(self, frame: bytes) -> None:
         """Feed one 48kHz mono Opus packet from the parent into the pipeline.
 
@@ -127,6 +140,7 @@ class Session:
         persona: Persona,
         model_config: ModelConfig,
         owner_user_id: str,
+        tools: list[dict] | None = None,
     ) -> str:
         if self._active_session_id is not None:
             raise SessionAlreadyActiveError("session already active")
@@ -146,7 +160,7 @@ class Session:
         self._gemini = _make_gemini_session(self._config.gemini_api_key)
 
         try:
-            await self._gemini.connect(composed_persona, model_config)
+            await self._gemini.connect(composed_persona, model_config, tools)
         except Exception as e:
             log.error("session_start_failed", extra={"error": str(e)})
             await self._teardown()

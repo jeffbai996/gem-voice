@@ -30,7 +30,13 @@ class _FakeSessionManager:
         self._active = None
         self._events: asyncio.Queue = asyncio.Queue()
 
-    async def start(self, persona, model_config, owner_user_id):
+    async def push_tool_response(self, call_id, name, response):
+        self.tool_responses = getattr(self, "tool_responses", [])
+        self.tool_responses.append((call_id, name, response))
+        return True
+
+    async def start(self, persona, model_config, owner_user_id, tools=None):
+        self.last_tools = tools
         self.join_called_with = {
             "persona": persona,
             "model_config": model_config,
@@ -244,5 +250,42 @@ async def test_disconnect_triggers_session_stop(short_sock_path):
         await writer.wait_closed()
         await asyncio.sleep(0.2)
         assert sm.leave_called is True
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_tool_response_routes_to_session(short_sock_path):
+    sock = short_sock_path
+    sm = _FakeSessionManager()
+    server = IpcServer(socket_path=sock, session_manager=sm)
+    await server.start()
+    try:
+        resp = await _send_recv(sock, {
+            "action": "tool_response", "id": "t1",
+            "call_id": "call-9", "name": "search_memory",
+            "response": {"result": "found it"},
+        })
+        assert resp["ok"] is True
+        assert sm.tool_responses == [
+            ("call-9", "search_memory", {"result": "found it"})]
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_tool_response_tolerates_string_result(short_sock_path):
+    sock = short_sock_path
+    sm = _FakeSessionManager()
+    server = IpcServer(socket_path=sock, session_manager=sm)
+    await server.start()
+    try:
+        resp = await _send_recv(sock, {
+            "action": "tool_response", "id": "t2",
+            "call_id": "call-1", "name": "fetch_url",
+            "response": "plain string",
+        })
+        assert resp["ok"] is True
+        assert sm.tool_responses[-1][2] == {"result": "plain string"}
     finally:
         await server.stop()

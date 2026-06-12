@@ -33,10 +33,13 @@ class _SessionManagerProto(Protocol):
         persona: Persona,
         model_config: ModelConfig,
         owner_user_id: str,
+        tools: list[dict] | None = None,
     ) -> str: ...
     async def stop(self) -> bool: ...
     def status(self) -> SessionStatus: ...
     def push_opus(self, frame: bytes) -> None: ...
+    async def push_tool_response(self, call_id: str, name: str,
+                                 response: dict) -> bool: ...
     @property
     def events(self) -> asyncio.Queue: ...
 
@@ -119,6 +122,8 @@ class IpcServer:
             return self._handle_status(req_id)
         if action == "audio_in":
             return self._handle_audio_in(req_id, msg)
+        if action == "tool_response":
+            return await self._handle_tool_response(req_id, msg)
         return {"id": req_id, "ok": False, "error": f"unknown action: {action!r}"}
 
     async def _handle_join(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
@@ -126,11 +131,15 @@ class IpcServer:
             persona = Persona(**msg["persona"])
             model_config = ModelConfig(**msg.get("model_config", {}))
             owner_user_id = msg["owner_user_id"]
+            tools = msg.get("tools") or None
+            if tools is not None and not isinstance(tools, list):
+                raise TypeError("tools must be a list of declarations")
         except (KeyError, TypeError) as e:
             return {"id": req_id, "ok": False, "error": f"bad join payload: {e}"}
 
         try:
-            session_id = await self.sm.start(persona, model_config, owner_user_id)
+            session_id = await self.sm.start(persona, model_config,
+                                             owner_user_id, tools)
         except RuntimeError as e:
             return {"id": req_id, "ok": False, "error": str(e)}
         return {"id": req_id, "ok": True, "session_id": session_id}
@@ -150,6 +159,21 @@ class IpcServer:
         # doesn't wait for an ack. Return a minimal ok response anyway so the
         # NDJSON parser stays happy if the parent ever does listen.
         return {"id": req_id, "ok": True}
+
+    async def _handle_tool_response(self, req_id: str,
+                                    msg: dict[str, Any]) -> dict[str, Any]:
+        """Parent finished executing a tool call — feed the result back."""
+        call_id = msg.get("call_id")
+        name = msg.get("name")
+        response = msg.get("response")
+        if not isinstance(call_id, str) or not isinstance(name, str):
+            return {"id": req_id, "ok": False,
+                    "error": "tool_response requires call_id + name"}
+        if not isinstance(response, dict):
+            # tolerate plain-string results from the parent's dispatcher
+            response = {"result": response}
+        ok = await self.sm.push_tool_response(call_id, name, response)
+        return {"id": req_id, "ok": ok}
 
     async def _handle_leave(self, req_id: str) -> dict[str, Any]:
         was_active = await self.sm.stop()
