@@ -50,6 +50,14 @@ class SessionEventType(str, Enum):
     # Audio frames flowing back to parent (model speech). Each event carries
     # a base64-encoded 48kHz mono Opus packet in data['b64'].
     AUDIO_OUT = "audio_out"
+    # Gemini requested a function call mid-conversation. data carries
+    # {id, name, args}; the parent executes and replies with a
+    # `tool_response` IPC action.
+    TOOL_CALL = "tool_call"
+    # The speaker interrupted the model mid-reply (barge-in). The parent
+    # must drop all buffered playback immediately — the daemon has already
+    # flushed its own outbound queue.
+    AUDIO_FLUSH = "audio_flush"
 
 
 @dataclass(frozen=True)
