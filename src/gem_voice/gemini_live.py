@@ -38,12 +38,16 @@ def _build_live_config(persona: Persona, model_config: ModelConfig,
     of what it heard tells us whether server-side VAD is working; the
     output transcription tells us what it tried to say.
     """
-    cfg_tools = None
+    # Always give voice web grounding via the built-in google_search tool — text
+    # Gemma has it, voice lacked it. On the 3.x live model built-in tools combine
+    # with custom function-calling, so google_search grounds alongside the IPC
+    # function declarations.
+    cfg_tools = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
     if tools:
         # Declarations arrive as plain dicts over IPC (the parent's
         # FunctionDeclaration JSON) — the SDK accepts dict-shaped
         # declarations inside a Tool wrapper.
-        cfg_tools = [genai_types.Tool(function_declarations=tools)]
+        cfg_tools.append(genai_types.Tool(function_declarations=tools))
     return genai_types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         tools=cfg_tools,
