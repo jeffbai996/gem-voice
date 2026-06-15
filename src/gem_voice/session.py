@@ -17,6 +17,7 @@ mature.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import os
 import time
@@ -268,6 +269,11 @@ class Session:
 
     async def _compose_persona(self, persona: Persona) -> Persona:
         new_prompt = persona.system_prompt
+        # Always tell voice Gemma the current time — she was blind to "now"
+        # and hallucinating dates. host-a runs in Springfield (local tz).
+        _now = datetime.datetime.now().astimezone().strftime("%A, %B %d %Y, %-I:%M %p %Z")
+        new_prompt = (f'{new_prompt}\n\nThe current date and time is {_now}. '
+                      'Treat this as "now" — do not guess the date.')
         if persona.memory_query:
             snippets = await fetch_context(
                 query=persona.memory_query,
