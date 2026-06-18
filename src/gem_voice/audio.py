@@ -147,7 +147,9 @@ class OpusDecoder:
     """Wraps discord.opus.Decoder. Returns mono PCM from stereo Opus output.
 
     libopus is forgiving — invalid packets decode to silence-shaped frames
-    at the C layer, so we don't need a try/except for "garbage in." The
+    at the C layer — but discord.opus.Decoder RAISES OpusError on a
+    malformed/truncated packet (not silent), so callers that loop over a
+    lossy stream MUST guard the call (see Session._decode_loop). The
     decode is at fixed 48kHz stereo internally; we downmix to mono for the
     rest of the pipeline.
     """

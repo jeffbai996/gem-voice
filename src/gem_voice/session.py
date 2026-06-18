@@ -88,6 +88,12 @@ class Session:
         # is a context-free WARNING — you can't tell one hiccup from sustained
         # loss. Logged as a running total each time a drop happens.
         self._opus_dropped: int = 0
+        # Cumulative opus frames dropped because decode/encode RAISED
+        # (malformed packet from a lossy Discord voice stream). One bad
+        # frame must NOT kill the loop — it used to escape and silently
+        # mute the whole session while status() still reported active.
+        self._opus_decode_dropped: int = 0
+        self._opus_encode_dropped: int = 0
         self._idle_timeout_s = int(os.environ.get("GEM_VOICE_IDLE_TIMEOUT_S", "300"))   # 5 min
         self._hard_max_s = int(os.environ.get("GEM_VOICE_MAX_DURATION_S", "1800"))      # 30 min
 
@@ -317,8 +323,14 @@ class Session:
                 opus = await opus_in.get()
             except asyncio.CancelledError:
                 return
-            pcm_48k = decoder.decode(opus)
-            pcm_16k = resample_pcm16(pcm_48k, src_rate=48000, dst_rate=16000)
+            try:
+                pcm_48k = decoder.decode(opus)
+                pcm_16k = resample_pcm16(pcm_48k, src_rate=48000, dst_rate=16000)
+            except Exception:  # noqa: BLE001 — bad opus frame must not kill the loop
+                self._opus_decode_dropped += 1
+                log.warning("decode_drop",
+                            extra={"dropped_total": self._opus_decode_dropped})
+                continue
             frame_count += 1
             if frame_count == 1 or frame_count % 100 == 0:
                 log.info("decode_loop_progress",
@@ -343,13 +355,25 @@ class Session:
                 pcm_24k = await pcm_out.get()
             except asyncio.CancelledError:
                 return
-            pcm_48k = leftover + resample_pcm16(
-                pcm_24k, src_rate=24000, dst_rate=48000)
+            try:
+                pcm_48k = leftover + resample_pcm16(
+                    pcm_24k, src_rate=24000, dst_rate=48000)
+            except Exception:  # noqa: BLE001 — bad model PCM must not kill the loop
+                self._opus_encode_dropped += 1
+                log.warning("encode_resample_drop",
+                            extra={"dropped_total": self._opus_encode_dropped})
+                continue
             usable = len(pcm_48k) - (len(pcm_48k) % frame_size)
             leftover = pcm_48k[usable:]
             for i in range(0, usable, frame_size):
                 frame = pcm_48k[i:i + frame_size]
-                opus = encoder.encode(frame)
+                try:
+                    opus = encoder.encode(frame)
+                except Exception:  # noqa: BLE001 — bad frame must not kill the loop
+                    self._opus_encode_dropped += 1
+                    log.warning("encode_drop",
+                                extra={"dropped_total": self._opus_encode_dropped})
+                    continue
                 if opus:
                     emitted += 1
                     if emitted == 1 or emitted % 100 == 0:
