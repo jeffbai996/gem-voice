@@ -40,6 +40,7 @@ class _SessionManagerProto(Protocol):
     def push_opus(self, frame: bytes) -> None: ...
     async def push_tool_response(self, call_id: str, name: str,
                                  response: dict) -> bool: ...
+    async def say(self, text: str) -> None: ...
     @property
     def events(self) -> asyncio.Queue: ...
 
@@ -124,7 +125,18 @@ class IpcServer:
             return self._handle_audio_in(req_id, msg)
         if action == "tool_response":
             return await self._handle_tool_response(req_id, msg)
+        if action == "say":
+            return self._handle_say(req_id, msg)
         return {"id": req_id, "ok": False, "error": f"unknown action: {action!r}"}
+
+    def _handle_say(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
+        """/voice speak: TTS `text` and stream it as audio_out. Fire-and-forget
+        so a multi-second synthesis never blocks the IPC dispatch loop."""
+        text = msg.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return {"id": req_id, "ok": False, "error": "say requires non-empty 'text'"}
+        asyncio.create_task(self.sm.say(text))
+        return {"id": req_id, "ok": True}
 
     async def _handle_join(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
         try:
