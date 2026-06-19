@@ -121,6 +121,65 @@ class Session:
                         extra={"tool_name": name, "error": str(e)})
             return False
 
+    async def say(self, text: str) -> None:
+        """Speak `text` in gem-voice's configured voice via Gemini TTS, emitting
+        it as AUDIO_OUT frames over the SAME encode/broadcast path the live model
+        uses — so it sounds identical. Drives /voice speak (text-driven): the
+        parent feeds chat-Gemma's reply, we synthesize + stream it back. Needs no
+        live Gemini session — the IPC broadcaster runs independently of one."""
+        import base64
+        text = (text or "").strip()
+        if not text:
+            return
+
+        def _synthesize() -> bytes:
+            # Gemini TTS shares the exact prebuilt voice set as Gemini Live, so
+            # voice_name = our configured Live voice => identical voice. The SDK
+            # call is blocking, hence asyncio.to_thread below.
+            from google import genai
+            from google.genai import types as gt
+            client = genai.Client(api_key=self._config.gemini_api_key)
+            model = os.environ.get("GEM_VOICE_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+            resp = client.models.generate_content(
+                model=model,
+                contents=text,
+                config=gt.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=gt.SpeechConfig(
+                        voice_config=gt.VoiceConfig(
+                            prebuilt_voice_config=gt.PrebuiltVoiceConfig(
+                                voice_name=self._config.gemini_voice)))))
+            return resp.candidates[0].content.parts[0].inline_data.data  # 24kHz s16le mono
+
+        try:
+            pcm_24k = await asyncio.to_thread(_synthesize)
+        except Exception as e:  # noqa: BLE001 — a TTS failure must not crash the daemon
+            log.warning("say_tts_failed", extra={"error": str(e), "chars": len(text)})
+            return
+        try:
+            pcm_48k = resample_pcm16(pcm_24k, src_rate=24000, dst_rate=48000)
+        except Exception as e:  # noqa: BLE001
+            log.warning("say_resample_failed", extra={"error": str(e)})
+            return
+
+        encoder = OpusEncoder()
+        frame_size = 1920  # 20ms @ 48kHz int16 mono — matches _encode_loop
+        usable = len(pcm_48k) - (len(pcm_48k) % frame_size)
+        emitted = 0
+        for i in range(0, usable, frame_size):
+            try:
+                opus = encoder.encode(pcm_48k[i:i + frame_size])
+            except Exception:  # noqa: BLE001 — one bad frame must not stop the rest
+                continue
+            if opus:
+                emitted += 1
+                await self._events.put(SessionEvent(
+                    type=SessionEventType.AUDIO_OUT,
+                    data={"b64": base64.b64encode(opus).decode("ascii")},
+                ))
+        log.info("say_done", extra={"chars": len(text), "opus_frames": emitted,
+                                    "pcm24k_bytes": len(pcm_24k)})
+
     def push_opus(self, frame: bytes) -> None:
         """Feed one 48kHz mono Opus packet from the parent into the pipeline.
 
