@@ -151,10 +151,21 @@ class Session:
                                 voice_name=self._config.gemini_voice)))))
             return resp.candidates[0].content.parts[0].inline_data.data  # 24kHz s16le mono
 
-        try:
-            pcm_24k = await asyncio.to_thread(_synthesize)
-        except Exception as e:  # noqa: BLE001 — a TTS failure must not crash the daemon
-            log.warning("say_tts_failed", extra={"error": str(e), "chars": len(text)})
+        # The TTS preview API is occasionally flaky (transient 5xx / rate
+        # limits) — retry a couple times so a one-off hiccup doesn't silently
+        # drop the whole spoken reply (the text reply already posted).
+        pcm_24k: bytes | None = None
+        for attempt in range(3):
+            try:
+                pcm_24k = await asyncio.to_thread(_synthesize)
+                break
+            except Exception as e:  # noqa: BLE001 — a TTS failure must not crash the daemon
+                log.warning("say_tts_attempt_failed",
+                            extra={"attempt": attempt + 1, "error": str(e)})
+                if attempt < 2:
+                    await asyncio.sleep(0.4 * (attempt + 1))
+        if pcm_24k is None:
+            log.warning("say_tts_failed", extra={"chars": len(text)})
             return
         try:
             pcm_48k = resample_pcm16(pcm_24k, src_rate=24000, dst_rate=48000)
