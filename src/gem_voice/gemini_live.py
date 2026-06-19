@@ -30,7 +30,8 @@ def _make_client(api_key: str):
 
 
 def _build_live_config(persona: Persona, model_config: ModelConfig,
-                       tools: list[dict] | None = None) -> Any:
+                       tools: list[dict] | None = None,
+                       resume_handle: str | None = None) -> Any:
     """Construct the LiveConnectConfig for Gemini Live.
 
     output_audio_transcription / input_audio_transcription give us text-level
@@ -62,6 +63,12 @@ def _build_live_config(persona: Persona, model_config: ModelConfig,
         ),
         output_audio_transcription=genai_types.AudioTranscriptionConfig(),
         input_audio_transcription=genai_types.AudioTranscriptionConfig(),
+        # Enable session resumption so the server streams us resumption handles.
+        # On a goAway/drop we reconnect with the latest handle and the
+        # conversation continues. handle=None on first connect = a fresh
+        # resumable session.
+        session_resumption=genai_types.SessionResumptionConfig(
+            handle=resume_handle),
     )
 
 
@@ -74,13 +81,54 @@ class GeminiLiveSession:
         self._ctx = None
         self._session = None
         self._connected = False
+        # Session-resumption state. Gemini Live hangs up the WebSocket on a
+        # timer (a goAway after ~minutes) — without resuming, the call just
+        # dies mid-conversation (Jeff's "doesn't stay alive more than ~3 min").
+        # We keep the latest resumption handle the server pushes and reconnect
+        # with it; the model context carries over. _stopping guards a
+        # deliberate teardown from racing a reconnect.
+        self._resume_handle: str | None = None
+        self._stopping = False
+        self._persona: Persona | None = None
+        self._model_config: ModelConfig | None = None
+        self._tools: list[dict] | None = None
 
     async def connect(self, persona: Persona, model_config: ModelConfig,
                       tools: list[dict] | None = None) -> None:
-        cfg = _build_live_config(persona, model_config, tools)
+        # Fresh start: a new call must never resume a prior conversation's
+        # context, and _stopping clears from any earlier teardown.
+        self._stopping = False
+        self._resume_handle = None
+        # Stash config inputs so a mid-call resume rebuilds the same session
+        # (system prompt, tools, voice) and just swaps in the handle.
+        self._persona = persona
+        self._model_config = model_config
+        self._tools = tools
+        cfg = _build_live_config(persona, model_config, tools,
+                                 resume_handle=self._resume_handle)
         self._ctx = self._client.aio.live.connect(model=model_config.model, config=cfg)
         self._session = await self._ctx.__aenter__()
         self._connected = True
+
+    async def _reconnect(self) -> None:
+        """Tear down the dropped WS and reconnect using the latest resumption
+        handle. The model context carries over; the audio queues (owned by the
+        session) are untouched, so mic/playback resume after a brief gap."""
+        try:
+            if self._session is not None:
+                await self._session.close()
+            if self._ctx is not None:
+                await self._ctx.__aexit__(None, None, None)
+        except Exception as e:
+            log.info("gemini_resume_old_close_failed", extra={"error": str(e)})
+        cfg = _build_live_config(self._persona, self._model_config, self._tools,
+                                 resume_handle=self._resume_handle)
+        self._ctx = self._client.aio.live.connect(
+            model=self._model_config.model, config=cfg)
+        self._session = await self._ctx.__aenter__()
+        self._connected = True
+        log.info("gemini_resumed",
+                 extra={"handle_tail": (self._resume_handle or "")[-8:]})
 
     async def stream(
         self,
@@ -127,6 +175,9 @@ class GeminiLiveSession:
                     sent_since_end = 0
                     continue
                 if frame is None:
+                    # Stop sentinel from session.py = deliberate teardown.
+                    # Mark it so the stream loop doesn't try to resume.
+                    self._stopping = True
                     log.info("gemini_send_stopped", extra={"frames_sent": frame_count})
                     return
                 try:
@@ -170,6 +221,14 @@ class GeminiLiveSession:
                     turn = self._session.receive()
                     async for response in turn:
                         msg_count += 1
+                        # Resumption handle — the server pushes these
+                        # periodically; keep the latest so a drop can resume.
+                        sru = getattr(response, "session_resumption_update", None)
+                        if sru is not None:
+                            if (getattr(sru, "resumable", False)
+                                    and getattr(sru, "new_handle", None)):
+                                self._resume_handle = sru.new_handle
+                            continue
                         tool_call = getattr(response, "tool_call", None)
                         fcs = getattr(tool_call, "function_calls", None) \
                             if tool_call is not None else None
@@ -266,6 +325,13 @@ class GeminiLiveSession:
                     # Turn iterator ended naturally — loop to receive the next
                     # turn. The connection stays open until close() is called.
             except Exception as e:
+                if self._resume_handle and not self._stopping:
+                    # goAway / dropped WS but we hold a resumption handle — not
+                    # fatal. Return quietly; stream() reconnects and resumes.
+                    log.info("gemini_recv_dropped_resumable",
+                             extra={"error": str(e)[:200],
+                                    "msgs_received": msg_count})
+                    return
                 log.warning("gemini_recv_failed",
                             extra={"error": str(e), "msgs_received": msg_count,
                                    "audio_chunks": audio_chunk_count,
@@ -276,15 +342,37 @@ class GeminiLiveSession:
                     data={"fatal": True, "message": f"gemini recv failed: {e}"},
                 ))
 
-        send_task = asyncio.create_task(_send_loop())
-        recv_task = asyncio.create_task(_recv_loop())
-
-        await send_task
-        recv_task.cancel()
-        try:
-            await recv_task
-        except asyncio.CancelledError:
-            pass
+        # Run send+recv until one ends, then decide: a clean stop (the sentinel
+        # set self._stopping) ends the session; a recv drop while we hold a
+        # resumption handle is a goAway/timeout → reconnect and keep going. The
+        # audio queues persist across reconnects (session.py owns them), so the
+        # call survives the WS hangup with only a brief gap.
+        while True:
+            send_task = asyncio.create_task(_send_loop())
+            recv_task = asyncio.create_task(_recv_loop())
+            _, pending = await asyncio.wait(
+                {send_task, recv_task}, return_when=asyncio.FIRST_COMPLETED)
+            for tk in pending:
+                tk.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if self._stopping:
+                return
+            if not self._resume_handle:
+                # Nothing to resume from (e.g. died before the first handle, a
+                # config rejection) — recv already emitted the fatal error.
+                return
+            log.info("gemini_resuming",
+                     extra={"handle_tail": self._resume_handle[-8:]})
+            try:
+                await self._reconnect()
+            except Exception as e:
+                log.warning("gemini_resume_failed", extra={"error": str(e)})
+                await events.put(SessionEvent(
+                    type=SessionEventType.ERROR,
+                    data={"fatal": True,
+                          "message": f"gemini resume failed: {e}"}))
+                return
 
     async def send_tool_response(self, call_id: str, name: str,
                                  response: dict) -> None:
@@ -299,6 +387,9 @@ class GeminiLiveSession:
                  extra={"tool_name": name, "call_id": call_id})
 
     async def close(self) -> None:
+        # Mark stopping first so any in-flight stream() loop won't try to resume
+        # a session we're deliberately tearing down.
+        self._stopping = True
         if not self._connected:
             return
         try:
