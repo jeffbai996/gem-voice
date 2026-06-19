@@ -176,18 +176,35 @@ class Session:
         encoder = OpusEncoder()
         frame_size = 1920  # 20ms @ 48kHz int16 mono — matches _encode_loop
         usable = len(pcm_48k) - (len(pcm_48k) % frame_size)
+        # Realtime pacer — load-bearing. The Live encode loop is paced by
+        # Gemini's streaming source (audio arrives at ~playback rate), so the
+        # gem-bot jitter-buffer + re-arm playback logic — tuned for that
+        # realtime trickle — stays happy. TTS hands us the WHOLE utterance at
+        # once; bursting every frame instantly overran that logic (player
+        # starved → re-armed → dropped most frames → "no voice heard"). So we
+        # meter emission to the playback clock: burst a ~0.5s lead to fill
+        # gem-bot's jitter bank, then coast at 20ms/frame so the player keeps a
+        # steady cushion and never starves. Deadline-based to avoid drift.
+        loop = asyncio.get_running_loop()
+        frame_dur = 0.02   # 20ms per opus frame
+        lead = 0.5         # stay ≤500ms ahead of the playback clock
+        start = loop.time()
         emitted = 0
         for i in range(0, usable, frame_size):
             try:
                 opus = encoder.encode(pcm_48k[i:i + frame_size])
             except Exception:  # noqa: BLE001 — one bad frame must not stop the rest
                 continue
-            if opus:
-                emitted += 1
-                await self._events.put(SessionEvent(
-                    type=SessionEventType.AUDIO_OUT,
-                    data={"b64": base64.b64encode(opus).decode("ascii")},
-                ))
+            if not opus:
+                continue
+            await self._events.put(SessionEvent(
+                type=SessionEventType.AUDIO_OUT,
+                data={"b64": base64.b64encode(opus).decode("ascii")},
+            ))
+            emitted += 1
+            delay = (start + emitted * frame_dur - lead) - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
         log.info("say_done", extra={"chars": len(text), "opus_frames": emitted,
                                     "pcm24k_bytes": len(pcm_24k)})
 
