@@ -72,6 +72,25 @@ def _build_live_config(persona: Persona, model_config: ModelConfig,
     )
 
 
+def _synth_thinking_blip(hz: float, gain: float,
+                         dur_s: float = 0.18, rate: int = 24000) -> bytes:
+    """One soft 'thinking' blip as 24kHz mono s16le PCM (the pcm_out format).
+
+    A Hann-windowed sine — the window fades the blip in and out so it sounds
+    like a gentle 'bloop', no clicks. Quiet by design (gain ≪ 1); it's an
+    'I'm still here' cue under Gemma's silence, not a notification."""
+    import math
+    import struct
+    n = max(1, int(rate * dur_s))
+    amp = max(0.0, min(1.0, gain)) * 32767.0
+    out = bytearray()
+    for i in range(n):
+        window = math.sin(math.pi * i / n) ** 2  # raised-cosine, 0→1→0
+        s = amp * window * math.sin(2 * math.pi * hz * i / rate)
+        out += struct.pack("<h", int(max(-32768.0, min(32767.0, s))))
+    return bytes(out)
+
+
 class GeminiLiveSession:
     """One Gemini Live session over its lifetime."""
 
@@ -89,6 +108,11 @@ class GeminiLiveSession:
         # deliberate teardown from racing a reconnect.
         self._resume_handle: str | None = None
         self._stopping = False
+        # True while the model is "thinking" — the gap between the user's
+        # utterance committing (or a tool call) and the model's audio starting.
+        # The thinking-tone loop reads this to play a soft cue so a call
+        # doesn't feel dead during a pause.
+        self._thinking = False
         self._persona: Persona | None = None
         self._model_config: ModelConfig | None = None
         self._tools: list[dict] | None = None
@@ -99,6 +123,7 @@ class GeminiLiveSession:
         # context, and _stopping clears from any earlier teardown.
         self._stopping = False
         self._resume_handle = None
+        self._thinking = False
         # Stash config inputs so a mid-call resume rebuilds the same session
         # (system prompt, tools, voice) and just swaps in the handle.
         self._persona = persona
@@ -114,6 +139,7 @@ class GeminiLiveSession:
         """Tear down the dropped WS and reconnect using the latest resumption
         handle. The model context carries over; the audio queues (owned by the
         session) are untouched, so mic/playback resume after a brief gap."""
+        self._thinking = False  # don't carry a stuck thinking-tone across a drop
         try:
             if self._session is not None:
                 await self._session.close()
@@ -173,6 +199,9 @@ class GeminiLiveSession:
                         log.warning("gemini_stream_end_failed",
                                     extra={"error": str(e)})
                     sent_since_end = 0
+                    # Utterance committed → the model is now thinking until its
+                    # first audio chunk lands. Drives the thinking-tone cue.
+                    self._thinking = True
                     continue
                 if frame is None:
                     # Stop sentinel from session.py = deliberate teardown.
@@ -243,6 +272,9 @@ class GeminiLiveSession:
                                           "name": fc.name,
                                           "args": dict(fc.args or {})},
                                 ))
+                            # Tool round-trip is a "working" gap too — keep the
+                            # thinking cue going until the model speaks.
+                            self._thinking = True
                             continue
                         server_content = getattr(response, "server_content", None)
                         if (server_content is not None
@@ -289,6 +321,8 @@ class GeminiLiveSession:
                             for part in getattr(model_turn, "parts", []) or []:
                                 inline = getattr(part, "inline_data", None)
                                 if inline is not None and getattr(inline, "data", None):
+                                    # Model is speaking now → thinking over.
+                                    self._thinking = False
                                     audio_chunk_count += 1
                                     if audio_chunk_count <= 3:
                                         log.info("gemini_audio_chunk",
@@ -313,6 +347,7 @@ class GeminiLiveSession:
                                      extra={"chars": output_transcript_chars,
                                             "text": out_tx.text[:200]})
                         if getattr(server_content, "turn_complete", False):
+                            self._thinking = False
                             log.info("gemini_turn_complete",
                                      extra={"msgs": msg_count,
                                             "audio_chunks": audio_chunk_count,
@@ -342,37 +377,78 @@ class GeminiLiveSession:
                     data={"fatal": True, "message": f"gemini recv failed: {e}"},
                 ))
 
-        # Run send+recv until one ends, then decide: a clean stop (the sentinel
-        # set self._stopping) ends the session; a recv drop while we hold a
-        # resumption handle is a goAway/timeout → reconnect and keep going. The
-        # audio queues persist across reconnects (session.py owns them), so the
-        # call survives the WS hangup with only a brief gap.
-        while True:
-            send_task = asyncio.create_task(_send_loop())
-            recv_task = asyncio.create_task(_recv_loop())
-            _, pending = await asyncio.wait(
-                {send_task, recv_task}, return_when=asyncio.FIRST_COMPLETED)
-            for tk in pending:
-                tk.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            if self._stopping:
+        async def _thinking_tone_loop():
+            """Soft periodic cue while the model is thinking, so a call doesn't
+            feel dead during a pause. Call-only by construction — only the Live
+            session (this stream) runs it; /voice speak has no Live session. The
+            blip rides pcm_out through the same encode/playback path as the
+            model's voice. Knobs are env-tunable for tuning by ear."""
+            if os.environ.get("GEM_VOICE_THINKING_TONE", "1") != "1":
                 return
-            if not self._resume_handle:
-                # Nothing to resume from (e.g. died before the first handle, a
-                # config rejection) — recv already emitted the fatal error.
-                return
-            log.info("gemini_resuming",
-                     extra={"handle_tail": self._resume_handle[-8:]})
+            hz = float(os.environ.get("GEM_VOICE_THINKING_TONE_HZ", "396"))
+            grace_s = float(os.environ.get("GEM_VOICE_THINKING_TONE_GRACE_S", "0.7"))
+            gap_s = float(os.environ.get("GEM_VOICE_THINKING_TONE_GAP_S", "1.3"))
+            gain = float(os.environ.get("GEM_VOICE_THINKING_TONE_GAIN", "0.12"))
+            blip = _synth_thinking_blip(hz, gain)
+            while not self._stopping:
+                if not self._thinking:
+                    await asyncio.sleep(0.1)
+                    continue
+                # Thinking just started — hold a grace period so quick replies
+                # don't trigger a blip; abort if it clears in the meantime.
+                waited = 0.0
+                while waited < grace_s and self._thinking and not self._stopping:
+                    await asyncio.sleep(0.1)
+                    waited += 0.1
+                # Then blip on a steady cadence until the model speaks.
+                while self._thinking and not self._stopping:
+                    await pcm_out.put(blip)
+                    slept = 0.0
+                    while slept < gap_s and self._thinking and not self._stopping:
+                        await asyncio.sleep(0.1)
+                        slept += 0.1
+
+        # The thinking cue runs for the whole session, independent of the WS so
+        # reconnects don't disturb it.
+        tone_task = asyncio.create_task(_thinking_tone_loop())
+        try:
+            # Run send+recv until one ends, then decide: a clean stop (the
+            # sentinel set self._stopping) ends the session; a recv drop while
+            # we hold a resumption handle is a goAway/timeout → reconnect and
+            # keep going. The audio queues persist across reconnects (session.py
+            # owns them), so the call survives the WS hangup with a brief gap.
+            while True:
+                send_task = asyncio.create_task(_send_loop())
+                recv_task = asyncio.create_task(_recv_loop())
+                _, pending = await asyncio.wait(
+                    {send_task, recv_task}, return_when=asyncio.FIRST_COMPLETED)
+                for tk in pending:
+                    tk.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                if self._stopping:
+                    return
+                if not self._resume_handle:
+                    # Nothing to resume from (e.g. died before the first handle,
+                    # a config rejection) — recv already emitted the fatal error.
+                    return
+                log.info("gemini_resuming",
+                         extra={"handle_tail": self._resume_handle[-8:]})
+                try:
+                    await self._reconnect()
+                except Exception as e:
+                    log.warning("gemini_resume_failed", extra={"error": str(e)})
+                    await events.put(SessionEvent(
+                        type=SessionEventType.ERROR,
+                        data={"fatal": True,
+                              "message": f"gemini resume failed: {e}"}))
+                    return
+        finally:
+            tone_task.cancel()
             try:
-                await self._reconnect()
-            except Exception as e:
-                log.warning("gemini_resume_failed", extra={"error": str(e)})
-                await events.put(SessionEvent(
-                    type=SessionEventType.ERROR,
-                    data={"fatal": True,
-                          "message": f"gemini resume failed: {e}"}))
-                return
+                await tone_task
+            except BaseException:
+                pass
 
     async def send_tool_response(self, call_id: str, name: str,
                                  response: dict) -> None:
