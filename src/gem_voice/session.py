@@ -187,7 +187,10 @@ class Session:
         # steady cushion and never starves. Deadline-based to avoid drift.
         loop = asyncio.get_running_loop()
         frame_dur = 0.02   # 20ms per opus frame
-        lead = 0.5         # stay ≤500ms ahead of the playback clock
+        # Lead = how far ahead of the playback clock we emit. Lower = less
+        # startup latency; gem-bot's jitter buffer supplies the rest of the
+        # cushion. Trimmed 0.5→0.3 to cut speak latency. Env-tunable.
+        lead = float(os.environ.get("GEM_VOICE_SAY_LEAD_S", "0.3"))
         start = loop.time()
         emitted = 0
         for i in range(0, usable, frame_size):
