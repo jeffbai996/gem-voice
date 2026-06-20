@@ -128,21 +128,44 @@ class Session:
         parent feeds chat-Gemma's reply, we synthesize + stream it back. Needs no
         live Gemini session — the IPC broadcaster runs independently of one."""
         import base64
+        import re
         text = (text or "").strip()
         if not text:
             return
 
-        def _synthesize() -> bytes:
+        def _chunk_for_tts(s: str, min_chars: int = 30) -> list[str]:
+            # Split on sentence boundaries; accumulate until ≥min_chars so we
+            # don't fire a TTS call per tiny fragment, but keep normal sentences
+            # as separate chunks (the first one synthesizes + plays fast while
+            # the rest cook — the latency win). A truly tiny leftover (<15 chars,
+            # e.g. "Ok.") glues onto the previous chunk to avoid a clipped call.
+            parts = [p for p in re.split(r"(?<=[.!?。！？…])\s+", s.strip()) if p]
+            out: list[str] = []
+            cur = ""
+            for p in parts:
+                cur = f"{cur} {p}".strip() if cur else p
+                if len(cur) >= min_chars:
+                    out.append(cur)
+                    cur = ""
+            if cur:
+                if out and len(cur) < 15:
+                    out[-1] = f"{out[-1]} {cur}".strip()
+                else:
+                    out.append(cur)
+            return out or [s]
+
+        chunks = _chunk_for_tts(text)
+        model = os.environ.get("GEM_VOICE_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+
+        def _synthesize(segment: str) -> bytes:
             # Gemini TTS shares the exact prebuilt voice set as Gemini Live, so
-            # voice_name = our configured Live voice => identical voice. The SDK
-            # call is blocking, hence asyncio.to_thread below.
+            # voice_name = our configured voice => identical voice. Blocking SDK
+            # call → asyncio.to_thread.
             from google import genai
             from google.genai import types as gt
             client = genai.Client(api_key=self._config.gemini_api_key)
-            model = os.environ.get("GEM_VOICE_TTS_MODEL", "gemini-2.5-flash-preview-tts")
             resp = client.models.generate_content(
-                model=model,
-                contents=text,
+                model=model, contents=segment,
                 config=gt.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=gt.SpeechConfig(
@@ -151,65 +174,83 @@ class Session:
                                 voice_name=self._config.gemini_voice)))))
             return resp.candidates[0].content.parts[0].inline_data.data  # 24kHz s16le mono
 
-        # The TTS preview API is occasionally flaky (transient 5xx / rate
-        # limits) — retry a couple times so a one-off hiccup doesn't silently
-        # drop the whole spoken reply (the text reply already posted).
-        pcm_24k: bytes | None = None
-        for attempt in range(3):
-            try:
-                pcm_24k = await asyncio.to_thread(_synthesize)
-                break
-            except Exception as e:  # noqa: BLE001 — a TTS failure must not crash the daemon
-                log.warning("say_tts_attempt_failed",
-                            extra={"attempt": attempt + 1, "error": str(e)})
-                if attempt < 2:
-                    await asyncio.sleep(0.4 * (attempt + 1))
-        if pcm_24k is None:
-            log.warning("say_tts_failed", extra={"chars": len(text)})
-            return
-        try:
-            pcm_48k = resample_pcm16(pcm_24k, src_rate=24000, dst_rate=48000)
-        except Exception as e:  # noqa: BLE001
-            log.warning("say_resample_failed", extra={"error": str(e)})
-            return
+        async def _synth_retry(segment: str) -> "bytes | None":
+            # TTS preview API is occasionally flaky — retry so a one-off hiccup
+            # doesn't drop a chunk (the text reply already posted).
+            for attempt in range(3):
+                try:
+                    return await asyncio.to_thread(_synthesize, segment)
+                except Exception as e:  # noqa: BLE001 — must not crash the daemon
+                    log.warning("say_tts_attempt_failed",
+                                extra={"attempt": attempt + 1,
+                                       "seg_chars": len(segment), "error": str(e)})
+                    if attempt < 2:
+                        await asyncio.sleep(0.4 * (attempt + 1))
+            return None
 
+        # PRODUCER: synthesize each chunk → push its 48kHz PCM onto the queue,
+        # running AHEAD of playback so later sentences cook while earlier ones
+        # play. That's the latency win: time-to-first-audio = first chunk's
+        # synth, not the whole reply's.
+        pcm_q: "asyncio.Queue" = asyncio.Queue()
+
+        async def _producer() -> None:
+            for seg in chunks:
+                pcm24 = await _synth_retry(seg)
+                if pcm24 is None:
+                    continue
+                try:
+                    pcm48 = resample_pcm16(pcm24, src_rate=24000, dst_rate=48000)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("say_resample_failed", extra={"error": str(e)})
+                    continue
+                await pcm_q.put(pcm48)
+            await pcm_q.put(None)  # done sentinel
+
+        prod = asyncio.create_task(_producer())
+
+        # CONSUMER: encode + pace frames from each chunk as it arrives, on ONE
+        # continuous playback clock so chunks butt up seamlessly. Same realtime
+        # pacer (burst a small lead to fill gem-bot's jitter bank, then coast at
+        # 20ms/frame). The clock starts at the FIRST emitted frame so the wait
+        # for chunk-1 synth doesn't make us burst to "catch up".
         encoder = OpusEncoder()
-        frame_size = 1920  # 20ms @ 48kHz int16 mono — matches _encode_loop
-        usable = len(pcm_48k) - (len(pcm_48k) % frame_size)
-        # Realtime pacer — load-bearing. The Live encode loop is paced by
-        # Gemini's streaming source (audio arrives at ~playback rate), so the
-        # gem-bot jitter-buffer + re-arm playback logic — tuned for that
-        # realtime trickle — stays happy. TTS hands us the WHOLE utterance at
-        # once; bursting every frame instantly overran that logic (player
-        # starved → re-armed → dropped most frames → "no voice heard"). So we
-        # meter emission to the playback clock: burst a ~0.5s lead to fill
-        # gem-bot's jitter bank, then coast at 20ms/frame so the player keeps a
-        # steady cushion and never starves. Deadline-based to avoid drift.
+        frame_size = 1920  # 20ms @ 48kHz int16 mono
         loop = asyncio.get_running_loop()
-        frame_dur = 0.02   # 20ms per opus frame
-        # Lead = how far ahead of the playback clock we emit. Lower = less
-        # startup latency; gem-bot's jitter buffer supplies the rest of the
-        # cushion. Trimmed 0.5→0.3 to cut speak latency. Env-tunable.
+        frame_dur = 0.02
         lead = float(os.environ.get("GEM_VOICE_SAY_LEAD_S", "0.3"))
-        start = loop.time()
+        start: "float | None" = None
         emitted = 0
-        for i in range(0, usable, frame_size):
+        try:
+            while True:
+                pcm48 = await pcm_q.get()
+                if pcm48 is None:
+                    break
+                usable = len(pcm48) - (len(pcm48) % frame_size)
+                for i in range(0, usable, frame_size):
+                    try:
+                        opus = encoder.encode(pcm48[i:i + frame_size])
+                    except Exception:  # noqa: BLE001 — one bad frame mustn't stop the rest
+                        continue
+                    if not opus:
+                        continue
+                    await self._events.put(SessionEvent(
+                        type=SessionEventType.AUDIO_OUT,
+                        data={"b64": base64.b64encode(opus).decode("ascii")},
+                    ))
+                    if start is None:
+                        start = loop.time()
+                    emitted += 1
+                    delay = (start + emitted * frame_dur - lead) - loop.time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+        finally:
             try:
-                opus = encoder.encode(pcm_48k[i:i + frame_size])
-            except Exception:  # noqa: BLE001 — one bad frame must not stop the rest
-                continue
-            if not opus:
-                continue
-            await self._events.put(SessionEvent(
-                type=SessionEventType.AUDIO_OUT,
-                data={"b64": base64.b64encode(opus).decode("ascii")},
-            ))
-            emitted += 1
-            delay = (start + emitted * frame_dur - lead) - loop.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
-        log.info("say_done", extra={"chars": len(text), "opus_frames": emitted,
-                                    "pcm24k_bytes": len(pcm_24k)})
+                await prod
+            except Exception:  # noqa: BLE001
+                pass
+        log.info("say_done", extra={"chars": len(text),
+                                    "chunks": len(chunks), "opus_frames": emitted})
 
     def push_opus(self, frame: bytes) -> None:
         """Feed one 48kHz mono Opus packet from the parent into the pipeline.
