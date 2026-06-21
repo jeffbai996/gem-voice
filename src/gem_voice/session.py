@@ -121,7 +121,7 @@ class Session:
                         extra={"tool_name": name, "error": str(e)})
             return False
 
-    async def say(self, text: str) -> None:
+    async def say(self, text: str, voice: str | None = None) -> None:
         """Speak `text` in gem-voice's configured voice via Gemini TTS, emitting
         it as AUDIO_OUT frames over the SAME encode/broadcast path the live model
         uses — so it sounds identical. Drives /voice speak (text-driven): the
@@ -159,8 +159,10 @@ class Session:
 
         def _synthesize(segment: str) -> bytes:
             # Gemini TTS shares the exact prebuilt voice set as Gemini Live, so
-            # voice_name = our configured voice => identical voice. Blocking SDK
-            # call → asyncio.to_thread.
+            # voice_name = our configured voice => identical voice. `voice` (the
+            # /voice type pick, passed per-say) overrides the configured default;
+            # absent → fall back to Config.gemini_voice. Blocking SDK call →
+            # asyncio.to_thread.
             from google import genai
             from google.genai import types as gt
             client = genai.Client(api_key=self._config.gemini_api_key)
@@ -171,7 +173,7 @@ class Session:
                     speech_config=gt.SpeechConfig(
                         voice_config=gt.VoiceConfig(
                             prebuilt_voice_config=gt.PrebuiltVoiceConfig(
-                                voice_name=self._config.gemini_voice)))))
+                                voice_name=(voice or self._config.gemini_voice))))))
             return resp.candidates[0].content.parts[0].inline_data.data  # 24kHz s16le mono
 
         async def _synth_retry(segment: str) -> "bytes | None":

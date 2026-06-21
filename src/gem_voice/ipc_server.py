@@ -40,7 +40,7 @@ class _SessionManagerProto(Protocol):
     def push_opus(self, frame: bytes) -> None: ...
     async def push_tool_response(self, call_id: str, name: str,
                                  response: dict) -> bool: ...
-    async def say(self, text: str) -> None: ...
+    async def say(self, text: str, voice: str | None = None) -> None: ...
     @property
     def events(self) -> asyncio.Queue: ...
 
@@ -135,7 +135,12 @@ class IpcServer:
         text = msg.get("text")
         if not isinstance(text, str) or not text.strip():
             return {"id": req_id, "ok": False, "error": "say requires non-empty 'text'"}
-        asyncio.create_task(self.sm.say(text))
+        # Optional per-utterance voice override (the /voice type pick). Ignore a
+        # non-string; say() falls back to the configured default when None.
+        voice = msg.get("voice")
+        if not isinstance(voice, str) or not voice.strip():
+            voice = None
+        asyncio.create_task(self.sm.say(text, voice))
         return {"id": req_id, "ok": True}
 
     async def _handle_join(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
