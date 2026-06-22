@@ -76,6 +76,12 @@ class Session:
         # Speak-mode "thinking tone": a soft blip loop played while the parent
         # generates a reply, cancelled the instant say() starts the real answer.
         self._thinking_task: "asyncio.Task | None" = None
+        # Speak-mode say SERIALIZATION: utterances queue + play one at a time so
+        # a second /voice speak message sent mid-playback doesn't trample the
+        # first on the wire (both emitting AUDIO_OUT at once = the second is lost).
+        self._say_queue: "asyncio.Queue[tuple[str, str | None]]" = asyncio.Queue()
+        self._say_worker_task: "asyncio.Task | None" = None
+        self._say_playing = False
         # Inbound opus frames from parent — fed via push_opus(), drained by _decode_loop.
         self._opus_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
         # Cost guardrails for the Live API (billed per-second of audio in +
@@ -125,14 +131,39 @@ class Session:
             return False
 
     async def say(self, text: str, voice: str | None = None) -> None:
+        """Queue `text` for spoken TTS. Says are SERIALIZED by a worker: a second
+        /voice speak message sent while the first is still playing waits its turn
+        and then plays, instead of overlapping on the wire (which dropped the
+        second). The thinking tone is stopped immediately on enqueue."""
+        # Kill any speak-mode thinking tone right now (don't wait for the worker
+        # to dequeue) — the real answer has arrived.
+        self.stop_thinking()
+        if not (text or "").strip():
+            return
+        self._say_queue.put_nowait((text, voice))
+        if self._say_worker_task is None or self._say_worker_task.done():
+            self._say_worker_task = asyncio.create_task(self._say_worker())
+
+    async def _say_worker(self) -> None:
+        """Drain the say queue one utterance at a time so they never overlap.
+        Long-lived: blocks on the queue; a per-item guard keeps one bad say from
+        killing the worker. `_say_playing` lets the thinking tone stand down."""
+        while True:
+            text, voice = await self._say_queue.get()
+            self._say_playing = True
+            try:
+                await self._do_say(text, voice)
+            except Exception as e:  # noqa: BLE001 — one bad say mustn't kill the worker
+                log.warning("say_worker_item_failed", extra={"error": str(e)})
+            finally:
+                self._say_playing = False
+
+    async def _do_say(self, text: str, voice: str | None = None) -> None:
         """Speak `text` in gem-voice's configured voice via Gemini TTS, emitting
         it as AUDIO_OUT frames over the SAME encode/broadcast path the live model
         uses — so it sounds identical. Drives /voice speak (text-driven): the
         parent feeds chat-Gemma's reply, we synthesize + stream it back. Needs no
         live Gemini session — the IPC broadcaster runs independently of one."""
-        # The real answer is starting — kill any speak-mode thinking tone so it
-        # doesn't bleed under the reply.
-        self.stop_thinking()
         import base64
         import re
         text = (text or "").strip()
@@ -266,6 +297,10 @@ class Session:
         with a soft 'still thinking' cue. Cancelled by stop_thinking(), which
         say() calls the instant the real answer audio starts."""
         if self._thinking_task is not None and not self._thinking_task.done():
+            return
+        # Don't play the tone over (or just before) an in-progress say — it would
+        # interleave with the reply on the AUDIO_OUT wire.
+        if self._say_playing or not self._say_queue.empty():
             return
         self._thinking_task = asyncio.create_task(self._thinking_tone_loop())
 
