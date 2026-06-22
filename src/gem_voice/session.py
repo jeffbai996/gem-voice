@@ -181,7 +181,9 @@ class Session:
             cur = ""
             for p in parts:
                 cur = f"{cur} {p}".strip() if cur else p
-                if len(cur) >= min_chars:
+                # First chunk flushes after ONE sentence (fast time-to-first-audio);
+                # later chunks accumulate to >=min_chars for synth efficiency.
+                if len(cur) >= (1 if not out else min_chars):
                     out.append(cur)
                     cur = ""
             if cur:
@@ -227,15 +229,24 @@ class Session:
                         await asyncio.sleep(0.4 * (attempt + 1))
             return None
 
-        # PRODUCER: synthesize each chunk → push its 48kHz PCM onto the queue,
-        # running AHEAD of playback so later sentences cook while earlier ones
-        # play. That's the latency win: time-to-first-audio = first chunk's
-        # synth, not the whole reply's.
+        # Synthesize all chunks CONCURRENTLY (bounded), then a PRODUCER awaits
+        # them IN ORDER and pushes 48kHz PCM onto the queue. Concurrency means
+        # later sentences are ready before the consumer reaches them (no dead air
+        # between chunks); in-order await keeps playback sequential. Time-to-first-
+        # audio = the (now smaller) first chunk's synth. Same TTS, same voice.
         pcm_q: "asyncio.Queue" = asyncio.Queue()
+        _synth_sem = asyncio.Semaphore(
+            int(os.environ.get("GEM_VOICE_SAY_SYNTH_CONCURRENCY", "4")))
+
+        async def _synth_bounded(seg: str) -> "bytes | None":
+            async with _synth_sem:
+                return await _synth_retry(seg)
+
+        synth_tasks = [asyncio.create_task(_synth_bounded(seg)) for seg in chunks]
 
         async def _producer() -> None:
-            for seg in chunks:
-                pcm24 = await _synth_retry(seg)
+            for t in synth_tasks:
+                pcm24 = await t
                 if pcm24 is None:
                     continue
                 try:
