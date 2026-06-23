@@ -49,7 +49,7 @@ def _build_live_config(persona: Persona, model_config: ModelConfig,
         # FunctionDeclaration JSON) — the SDK accepts dict-shaped
         # declarations inside a Tool wrapper.
         cfg_tools.append(genai_types.Tool(function_declarations=tools))
-    return genai_types.LiveConnectConfig(
+    cfg_kwargs = dict(
         response_modalities=["AUDIO"],
         tools=cfg_tools,
         system_instruction=persona.system_prompt,
@@ -70,6 +70,22 @@ def _build_live_config(persona: Persona, model_config: ModelConfig,
         session_resumption=genai_types.SessionResumptionConfig(
             handle=resume_handle),
     )
+    # Continuous-watch video config — GATED behind GEM_VOICE_VIDEO so audio-only
+    # calls are byte-identical to before. When on: cap frame detail (cost/latency)
+    # and add sliding-window context compression, which is what lets an
+    # audio+video session run past Gemini's ~2-minute uncompressed av-session cap.
+    # try/except guards an SDK that predates these fields — falls back to a working
+    # audio config rather than failing the connect.
+    if os.environ.get("GEM_VOICE_VIDEO", "0") == "1":
+        try:
+            cfg_kwargs["media_resolution"] = (
+                genai_types.MediaResolution.MEDIA_RESOLUTION_LOW)
+            cfg_kwargs["context_window_compression"] = (
+                genai_types.ContextWindowCompressionConfig(
+                    sliding_window=genai_types.SlidingWindow()))
+        except AttributeError as e:
+            log.warning("video_config_unavailable", extra={"error": str(e)})
+    return genai_types.LiveConnectConfig(**cfg_kwargs)
 
 
 def _synth_thinking_blip(hz: float, gain: float,
@@ -161,12 +177,15 @@ class GeminiLiveSession:
         pcm_in: asyncio.Queue,
         pcm_out: asyncio.Queue,
         events: asyncio.Queue,
+        video_in: asyncio.Queue | None = None,
     ) -> None:
         """Run the bidirectional model stream until input sentinel or error.
 
         - pcm_in:   bytes frames at 16kHz mono int16. None = stop sentinel.
         - pcm_out:  bytes frames at 24kHz mono int16 from the model.
         - events:   SessionEvent objects (turn boundaries, errors).
+        - video_in: optional JPEG frames for continuous-watch video. None (the
+                    default) = audio-only, byte-identical to before.
         """
         if not self._connected or self._session is None:
             raise RuntimeError("connect() must be called before stream()")
@@ -408,9 +427,60 @@ class GeminiLiveSession:
                         await asyncio.sleep(0.1)
                         slept += 0.1
 
-        # The thinking cue runs for the whole session, independent of the WS so
-        # reconnects don't disturb it.
+        async def _video_send_loop():
+            """Stream inbound JPEG frames to the Live session at <=1fps (the model
+            caps video at ~1 frame/sec; sending faster only burns tokens). Runs for
+            the whole session like the thinking tone — it reads the session-owned
+            video_in queue and sends on whatever self._session currently is, so it
+            survives WS reconnects (a frame lost in the reconnect gap is fine; video
+            is lossy-tolerant). No-op when no video queue is wired (audio-only)."""
+            if video_in is None:
+                return
+            fps = float(os.environ.get("GEM_VOICE_VIDEO_FPS", "1"))
+            min_interval = 1.0 / fps if fps > 0 else 1.0
+            loop = asyncio.get_running_loop()
+            last_sent = 0.0
+            frame_count = 0
+            while not self._stopping:
+                try:
+                    frame = await video_in.get()
+                except asyncio.CancelledError:
+                    return
+                if frame is None:   # optional stop sentinel
+                    return
+                # Freshest-frame-wins: if newer frames queued while we waited,
+                # skip to the latest and drop the stale ones.
+                while not video_in.empty():
+                    try:
+                        frame = video_in.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                # Rate-limit to <= target fps.
+                wait = min_interval - (loop.time() - last_sent)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                if self._stopping:
+                    return
+                if not self._connected or self._session is None:
+                    continue   # mid-reconnect — drop this frame, the next one rides
+                try:
+                    await self._session.send_realtime_input(
+                        video=genai_types.Blob(data=frame, mime_type="image/jpeg"))
+                    last_sent = loop.time()
+                    frame_count += 1
+                    if frame_count == 1 or frame_count % 60 == 0:
+                        log.info("gemini_video_progress",
+                                 extra={"frames_sent": frame_count,
+                                        "frame_bytes": len(frame)})
+                except Exception as e:  # noqa: BLE001 — a bad/late frame mustn't kill video
+                    log.warning("gemini_video_send_failed",
+                                extra={"error": str(e), "frames_sent": frame_count})
+                    continue
+
+        # The thinking cue + video send loop run for the whole session,
+        # independent of the WS so reconnects don't disturb them.
         tone_task = asyncio.create_task(_thinking_tone_loop())
+        video_task = asyncio.create_task(_video_send_loop())
         try:
             # Run send+recv until one ends, then decide: a clean stop (the
             # sentinel set self._stopping) ends the session; a recv drop while
@@ -444,11 +514,13 @@ class GeminiLiveSession:
                               "message": f"gemini resume failed: {e}"}))
                     return
         finally:
-            tone_task.cancel()
-            try:
-                await tone_task
-            except BaseException:
-                pass
+            for bg in (tone_task, video_task):
+                bg.cancel()
+            for bg in (tone_task, video_task):
+                try:
+                    await bg
+                except BaseException:
+                    pass
 
     async def send_tool_response(self, call_id: str, name: str,
                                  response: dict) -> None:
