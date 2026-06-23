@@ -84,6 +84,13 @@ class Session:
         self._say_playing = False
         # Inbound opus frames from parent — fed via push_opus(), drained by _decode_loop.
         self._opus_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        # Inbound JPEG video frames from a parent capture source — fed via
+        # push_video_frame(), drained by the Gemini video send loop at <=1fps.
+        # Small buffer + drop-oldest: video is lossy-tolerant and we only ever
+        # want the freshest frame on the wire, never a stale backlog.
+        self._video_in: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=int(os.environ.get("GEM_VOICE_VIDEO_QUEUE", "30")))
+        self._video_dropped: int = 0
         # Cost guardrails for the Live API (billed per-second of audio in +
         # per-token out). A forgotten session burns money until something
         # explicitly stops it. Two timers:
@@ -404,6 +411,30 @@ class Session:
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
 
+    def push_video_frame(self, frame: bytes) -> None:
+        """Feed one JPEG video frame from a parent capture source into the live
+        session.
+
+        Synchronous + non-blocking, mirroring push_opus. Drops the oldest frame
+        on overflow (freshest-frame-wins — video is 1fps and lossy-tolerant, so a
+        stale backlog is worse than a gap). Counts as activity so a video-only
+        stretch (camera on, speaker quiet) doesn't trip the idle watchdog.
+        """
+        if self._active_session_id is None:
+            return
+        self._last_opus_at = time.time()   # video is activity → keep session alive
+        try:
+            self._video_in.put_nowait(frame)
+        except asyncio.QueueFull:
+            try:
+                self._video_in.get_nowait()
+                self._video_in.put_nowait(frame)
+                self._video_dropped += 1
+                log.warning("video_in_overflow_drop_oldest",
+                            extra={"dropped_total": self._video_dropped})
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+
     async def start(
         self,
         persona: Persona,
@@ -446,13 +477,20 @@ class Session:
                 self._opus_in.get_nowait()
             except asyncio.QueueEmpty:
                 break
+        # Same for residual video frames — a new call must not see the last one's.
+        while not self._video_in.empty():
+            try:
+                self._video_in.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
         pcm_in: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
         pcm_out: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
 
         self._tasks = [
             asyncio.create_task(self._decode_loop(self._opus_in, pcm_in)),
-            asyncio.create_task(self._gemini.stream(pcm_in, pcm_out, self._events)),
+            asyncio.create_task(self._gemini.stream(
+                pcm_in, pcm_out, self._events, video_in=self._video_in)),
             asyncio.create_task(self._encode_loop(pcm_out)),
             asyncio.create_task(self._timeout_watchdog(sess_id, session_start_wall)),
         ]

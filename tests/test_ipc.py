@@ -62,6 +62,10 @@ class _FakeSessionManager:
         self.pushed_opus = getattr(self, 'pushed_opus', [])
         self.pushed_opus.append(frame)
 
+    def push_video_frame(self, frame: bytes) -> None:
+        self.pushed_video = getattr(self, 'pushed_video', [])
+        self.pushed_video.append(frame)
+
     @property
     def events(self) -> asyncio.Queue:
         return self._events
@@ -228,6 +232,38 @@ async def test_audio_in_rejects_missing_b64(short_sock_path):
     await server.start()
     try:
         resp = await _send_recv(sock, {"id": "au-2", "action": "audio_in"})
+        assert resp["ok"] is False
+        assert "b64" in resp["error"]
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_video_in_pushes_frame_to_session(short_sock_path):
+    """video_in action decodes b64 and forwards bytes to session.push_video_frame."""
+    import base64
+    sock = short_sock_path
+    sm = _FakeSessionManager()
+    server = IpcServer(socket_path=sock, session_manager=sm)
+    await server.start()
+    try:
+        jpeg_bytes = b"\xff\xd8\xff\xe0jpeg"
+        b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+        resp = await _send_recv(sock, {"id": "vi-1", "action": "video_in", "b64": b64})
+        assert resp["ok"] is True
+        assert sm.pushed_video == [jpeg_bytes]
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_video_in_rejects_missing_b64(short_sock_path):
+    sock = short_sock_path
+    sm = _FakeSessionManager()
+    server = IpcServer(socket_path=sock, session_manager=sm)
+    await server.start()
+    try:
+        resp = await _send_recv(sock, {"id": "vi-2", "action": "video_in"})
         assert resp["ok"] is False
         assert "b64" in resp["error"]
     finally:

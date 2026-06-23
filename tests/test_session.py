@@ -90,6 +90,31 @@ async def test_push_opus_ignored_when_idle(base_config):
 
 
 @pytest.mark.asyncio
+async def test_push_video_frame_ignored_when_idle(base_config):
+    """push_video_frame before start() is a no-op (no active session), not a crash."""
+    s = Session(base_config)
+    s.push_video_frame(b"\xff\xd8\xff")
+    assert s._video_in.empty()
+    assert s.status().active_session is None
+
+
+@pytest.mark.asyncio
+async def test_push_video_frame_drops_oldest_on_overflow(base_config, monkeypatch):
+    """A full video queue drops the OLDEST frame for the newest (freshest-wins,
+    since video is 1fps + lossy-tolerant) and bumps the drop counter."""
+    monkeypatch.setenv("GEM_VOICE_VIDEO_QUEUE", "3")
+    s = Session(base_config)
+    s._active_session_id = "sess-test"   # bypass start() to drive push_video_frame
+    for i in range(5):
+        s.push_video_frame(bytes([i]))
+    assert s._video_in.qsize() == 3
+    assert s._video_dropped == 2
+    # the three retained are the freshest frames (2, 3, 4), oldest two dropped
+    retained = [s._video_in.get_nowait() for _ in range(3)]
+    assert retained == [bytes([2]), bytes([3]), bytes([4])]
+
+
+@pytest.mark.asyncio
 async def test_compose_persona_appends_voice_override(base_config, persona):
     """Voice calls suspend inherited text-channel silence etiquette —
     the very first live smoke test went mute because the parent's

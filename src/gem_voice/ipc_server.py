@@ -38,6 +38,7 @@ class _SessionManagerProto(Protocol):
     async def stop(self) -> bool: ...
     def status(self) -> SessionStatus: ...
     def push_opus(self, frame: bytes) -> None: ...
+    def push_video_frame(self, frame: bytes) -> None: ...
     async def push_tool_response(self, call_id: str, name: str,
                                  response: dict) -> bool: ...
     async def say(self, text: str, voice: str | None = None) -> None: ...
@@ -125,6 +126,8 @@ class IpcServer:
             return self._handle_status(req_id)
         if action == "audio_in":
             return self._handle_audio_in(req_id, msg)
+        if action == "video_in":
+            return self._handle_video_in(req_id, msg)
         if action == "tool_response":
             return await self._handle_tool_response(req_id, msg)
         if action == "say":
@@ -189,6 +192,22 @@ class IpcServer:
         # Don't bother acking each audio_in; that's per-frame chatter. Parent
         # doesn't wait for an ack. Return a minimal ok response anyway so the
         # NDJSON parser stays happy if the parent ever does listen.
+        return {"id": req_id, "ok": True}
+
+    def _handle_video_in(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
+        """Inbound JPEG video frame from a parent capture source, base64 in
+        msg['b64']. Same wire shape as audio_in, but the bytes are a still image
+        (not Opus) — pushed straight through to the Live session, rate-limited to
+        ~1fps downstream. No per-frame ack (the parent streams fire-and-forget)."""
+        import base64
+        b64 = msg.get("b64")
+        if not isinstance(b64, str):
+            return {"id": req_id, "ok": False, "error": "video_in requires 'b64' string"}
+        try:
+            jpeg = base64.b64decode(b64)
+        except (ValueError, TypeError) as e:
+            return {"id": req_id, "ok": False, "error": f"bad b64: {e}"}
+        self.sm.push_video_frame(jpeg)
         return {"id": req_id, "ok": True}
 
     async def _handle_tool_response(self, req_id: str,
