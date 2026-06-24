@@ -42,8 +42,6 @@ class _SessionManagerProto(Protocol):
     async def push_tool_response(self, call_id: str, name: str,
                                  response: dict) -> bool: ...
     async def say(self, text: str, voice: str | None = None) -> None: ...
-    def start_thinking(self) -> None: ...
-    def stop_thinking(self) -> None: ...
     @property
     def events(self) -> asyncio.Queue: ...
 
@@ -151,13 +149,9 @@ class IpcServer:
         return {"id": req_id, "ok": True}
 
     def _handle_think(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
-        """/voice speak: toggle the soft 'thinking tone' while the parent is
-        generating a reply. `on: true` starts it, `on: false` stops it. The
-        next `say` also stops it automatically when the real answer begins."""
-        if bool(msg.get("on", True)):
-            self.sm.start_thinking()
-        else:
-            self.sm.stop_thinking()
+        """No-op. The 'thinking tone' was removed, but the parent bot may still
+        send a `think` IPC action — accept and ignore it so the wire contract
+        stays non-breaking (the parent never gets an 'unknown action' error)."""
         return {"id": req_id, "ok": True}
 
     async def _handle_join(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:

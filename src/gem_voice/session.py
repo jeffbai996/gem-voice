@@ -29,7 +29,7 @@ from gem_voice.audio import (
     OpusEncoder,
     resample_pcm16,
 )
-from gem_voice.gemini_live import GeminiLiveSession, _synth_thinking_blip
+from gem_voice.gemini_live import GeminiLiveSession
 from gem_voice.memory_client import fetch_context
 from gem_voice.types import (
     Config,
@@ -73,15 +73,11 @@ class Session:
         self._gemini: GeminiLiveSession | None = None
         self._tasks: list[asyncio.Task] = []
         self._events: asyncio.Queue[SessionEvent] = asyncio.Queue()
-        # Speak-mode "thinking tone": a soft blip loop played while the parent
-        # generates a reply, cancelled the instant say() starts the real answer.
-        self._thinking_task: "asyncio.Task | None" = None
         # Speak-mode say SERIALIZATION: utterances queue + play one at a time so
         # a second /voice speak message sent mid-playback doesn't trample the
         # first on the wire (both emitting AUDIO_OUT at once = the second is lost).
         self._say_queue: "asyncio.Queue[tuple[str, str | None]]" = asyncio.Queue()
         self._say_worker_task: "asyncio.Task | None" = None
-        self._say_playing = False
         # Inbound opus frames from parent — fed via push_opus(), drained by _decode_loop.
         self._opus_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
         # Inbound JPEG video frames from a parent capture source — fed via
@@ -141,10 +137,7 @@ class Session:
         """Queue `text` for spoken TTS. Says are SERIALIZED by a worker: a second
         /voice speak message sent while the first is still playing waits its turn
         and then plays, instead of overlapping on the wire (which dropped the
-        second). The thinking tone is stopped immediately on enqueue."""
-        # Kill any speak-mode thinking tone right now (don't wait for the worker
-        # to dequeue) — the real answer has arrived.
-        self.stop_thinking()
+        second)."""
         if not (text or "").strip():
             return
         self._say_queue.put_nowait((text, voice))
@@ -154,16 +147,13 @@ class Session:
     async def _say_worker(self) -> None:
         """Drain the say queue one utterance at a time so they never overlap.
         Long-lived: blocks on the queue; a per-item guard keeps one bad say from
-        killing the worker. `_say_playing` lets the thinking tone stand down."""
+        killing the worker."""
         while True:
             text, voice = await self._say_queue.get()
-            self._say_playing = True
             try:
                 await self._do_say(text, voice)
             except Exception as e:  # noqa: BLE001 — one bad say mustn't kill the worker
                 log.warning("say_worker_item_failed", extra={"error": str(e)})
-            finally:
-                self._say_playing = False
 
     async def _do_say(self, text: str, voice: str | None = None) -> None:
         """Speak `text` in gem-voice's configured voice via Gemini TTS, emitting
@@ -308,87 +298,6 @@ class Session:
                 pass
         log.info("say_done", extra={"chars": len(text),
                                     "chunks": len(chunks), "opus_frames": emitted})
-
-    def start_thinking(self) -> None:
-        """Begin the speak-mode thinking tone (idempotent). The parent fires this
-        when a /voice speak message lands; it fills the model-processing silence
-        with a soft 'still thinking' cue. Cancelled by stop_thinking(), which
-        say() calls the instant the real answer audio starts."""
-        if self._thinking_task is not None and not self._thinking_task.done():
-            return
-        # Don't play the tone over (or just before) an in-progress say — it would
-        # interleave with the reply on the AUDIO_OUT wire.
-        if self._say_playing or not self._say_queue.empty():
-            return
-        self._thinking_task = asyncio.create_task(self._thinking_tone_loop())
-
-    def stop_thinking(self) -> None:
-        """Cancel the speak-mode thinking tone if running. Idempotent + safe."""
-        t = self._thinking_task
-        self._thinking_task = None
-        if t is not None and not t.done():
-            t.cancel()
-
-    async def _thinking_tone_loop(self) -> None:
-        """Soft 'thinking' blips over the speak-mode AUDIO_OUT path while the
-        parent generates a reply. Emits a CONTINUOUS 20ms-paced stream — blip,
-        then gap_s of silence, repeating — so it rides gem-bot's jitter buffer
-        cleanly exactly like say(). A `grace_s` lead of silence means a fast
-        reply never produces an audible blip. Shares the call-mode env knobs."""
-        import base64
-        if os.environ.get("GEM_VOICE_THINKING_TONE", "1") != "1":
-            return
-        hz = float(os.environ.get("GEM_VOICE_THINKING_TONE_HZ", "396"))
-        grace_s = float(os.environ.get("GEM_VOICE_THINKING_TONE_GRACE_S", "0.5"))
-        gap_s = float(os.environ.get("GEM_VOICE_THINKING_TONE_GAP_S", "1.3"))
-        gain = float(os.environ.get("GEM_VOICE_THINKING_TONE_GAIN", "0.12"))
-        try:
-            blip48 = resample_pcm16(_synth_thinking_blip(hz, gain),
-                                    src_rate=24000, dst_rate=48000)
-        except Exception as e:  # noqa: BLE001
-            log.warning("thinking_blip_synth_failed", extra={"error": str(e)})
-            return
-        encoder = OpusEncoder()
-        frame_size = 1920  # 20ms @ 48kHz int16 mono
-        silence = b"\x00" * frame_size
-        usable = len(blip48) - (len(blip48) % frame_size)
-        blip_frames = [blip48[i:i + frame_size] for i in range(0, usable, frame_size)]
-        gap_frames = max(1, int(gap_s / 0.02))
-        grace_frames = max(0, int(grace_s / 0.02))
-        loop = asyncio.get_running_loop()
-        lead = float(os.environ.get("GEM_VOICE_SAY_LEAD_S", "0.3"))
-        start = loop.time()
-        emitted = 0
-
-        async def _emit(frame_pcm: bytes) -> None:
-            nonlocal emitted
-            try:
-                opus = encoder.encode(frame_pcm)
-            except Exception:  # noqa: BLE001 — one bad frame mustn't stop the tone
-                return
-            if opus:
-                await self._events.put(SessionEvent(
-                    type=SessionEventType.AUDIO_OUT,
-                    data={"b64": base64.b64encode(opus).decode("ascii")},
-                ))
-            emitted += 1
-            delay = (start + emitted * 0.02 - lead) - loop.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-        # Safety: if the parent never sends the real say() (model opted out /
-        # errored), self-stop so the tone can't loop forever.
-        max_s = float(os.environ.get("GEM_VOICE_THINKING_TONE_MAX_S", "30"))
-        try:
-            for _ in range(grace_frames):   # fast reply → tone never becomes audible
-                await _emit(silence)
-            while loop.time() - start < max_s:
-                for f in blip_frames:
-                    await _emit(f)
-                for _ in range(gap_frames):
-                    await _emit(silence)
-        except asyncio.CancelledError:
-            return
 
     def push_opus(self, frame: bytes) -> None:
         """Feed one 48kHz mono Opus packet from the parent into the pipeline.
