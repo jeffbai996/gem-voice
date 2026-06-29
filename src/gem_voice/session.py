@@ -73,11 +73,13 @@ class Session:
         self._gemini: GeminiLiveSession | None = None
         self._tasks: list[asyncio.Task] = []
         self._events: asyncio.Queue[SessionEvent] = asyncio.Queue()
-        # Speak-mode say SERIALIZATION: utterances queue + play one at a time so
-        # a second /voice speak message sent mid-playback doesn't trample the
-        # first on the wire (both emitting AUDIO_OUT at once = the second is lost).
-        self._say_queue: "asyncio.Queue[tuple[str, str | None]]" = asyncio.Queue()
-        self._say_worker_task: "asyncio.Task | None" = None
+        # Speak-mode say BARGE-IN: only ONE say plays at a time, but a new say
+        # PREEMPTS the in-flight one instead of queueing behind it. A second
+        # /voice speak message sent mid-playback cancels the first (and flushes
+        # the parent's banked frames via AUDIO_FLUSH) so the new utterance starts
+        # immediately. Supersedes the old serialize-queue (commit 9e3d9d2):
+        # serialization made the 2nd message wait; barge-in makes it interrupt.
+        self._active_say_task: "asyncio.Task | None" = None
         # Inbound opus frames from parent — fed via push_opus(), drained by _decode_loop.
         self._opus_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
         # Inbound JPEG video frames from a parent capture source — fed via
@@ -134,26 +136,54 @@ class Session:
             return False
 
     async def say(self, text: str, voice: str | None = None) -> None:
-        """Queue `text` for spoken TTS. Says are SERIALIZED by a worker: a second
-        /voice speak message sent while the first is still playing waits its turn
-        and then plays, instead of overlapping on the wire (which dropped the
-        second)."""
+        """Speak `text`, BARGING IN over any utterance currently playing.
+
+        If a say is already in flight, cancel it and flush the parent's playback
+        (AUDIO_FLUSH) so the old audio stops mid-word, then start this one. This
+        is the /voice speak barge-in: a new message preempts the old reply
+        instead of waiting behind it."""
         if not (text or "").strip():
             return
-        self._say_queue.put_nowait((text, voice))
-        if self._say_worker_task is None or self._say_worker_task.done():
-            self._say_worker_task = asyncio.create_task(self._say_worker())
+        # Preempt whatever's playing. _cancel_active_say emits the flush so the
+        # parent drops banked + in-flight frames; without it the old audio keeps
+        # playing on the wire for ~a second after we stop emitting.
+        await self._cancel_active_say()
+        self._active_say_task = asyncio.create_task(self._say_guarded(text, voice))
 
-    async def _say_worker(self) -> None:
-        """Drain the say queue one utterance at a time so they never overlap.
-        Long-lived: blocks on the queue; a per-item guard keeps one bad say from
-        killing the worker."""
-        while True:
-            text, voice = await self._say_queue.get()
-            try:
-                await self._do_say(text, voice)
-            except Exception as e:  # noqa: BLE001 — one bad say mustn't kill the worker
-                log.warning("say_worker_item_failed", extra={"error": str(e)})
+    async def cancel_say(self) -> bool:
+        """Stop any in-flight say and flush the parent's playback. Returns True if
+        a say was actually playing (and got cancelled), False if nothing was.
+
+        Used for full barge-in when a new turn starts but its spoken reply isn't
+        ready yet (e.g. the chat model is still generating) — we silence the old
+        answer now and the new say() lands when it's synthesized."""
+        return await self._cancel_active_say()
+
+    async def _cancel_active_say(self) -> bool:
+        """Cancel the active say task (if any) and emit AUDIO_FLUSH so the parent
+        drops banked/playing frames. Idempotent; returns whether one was live."""
+        task = self._active_say_task
+        self._active_say_task = None
+        if task is None or task.done():
+            return False
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        # Tell the parent to drop everything it has banked/playing for this say.
+        await self._events.put(SessionEvent(type=SessionEventType.AUDIO_FLUSH, data={}))
+        return True
+
+    async def _say_guarded(self, text: str, voice: str | None = None) -> None:
+        """Run one _do_say with a guard so a TTS error doesn't escape as an
+        unhandled task exception. Cancellation (barge-in) propagates cleanly."""
+        try:
+            await self._do_say(text, voice)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — one bad say mustn't crash the daemon
+            log.warning("say_item_failed", extra={"error": str(e)})
 
     async def _do_say(self, text: str, voice: str | None = None) -> None:
         """Speak `text` in gem-voice's configured voice via Gemini TTS, emitting
@@ -292,10 +322,21 @@ class Session:
                     if delay > 0:
                         await asyncio.sleep(delay)
         finally:
-            try:
-                await prod
-            except Exception:  # noqa: BLE001
-                pass
+            # Tear down the synth/producer fan-out. On a normal finish these are
+            # already done and this is a cheap await. On BARGE-IN cancellation
+            # (a new say preempted us mid-playback), the consumer loop above just
+            # took a CancelledError — we must cancel the producer + any in-flight
+            # TTS synth tasks so they don't keep calling the API and emitting
+            # AUDIO_OUT frames behind the new utterance. Cancel first, then await.
+            prod.cancel()
+            for t in synth_tasks:
+                if not t.done():
+                    t.cancel()
+            for t in (prod, *synth_tasks):
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
         log.info("say_done", extra={"chars": len(text),
                                     "chunks": len(chunks), "opus_frames": emitted})
 
@@ -466,6 +507,16 @@ class Session:
         return True
 
     async def _teardown(self) -> None:
+        # Stop any in-flight speak-mode utterance first so its synth/pacing tasks
+        # don't outlive the session (a /voice leave mid-say used to leak them).
+        say_task = self._active_say_task
+        self._active_say_task = None
+        if say_task is not None and not say_task.done():
+            say_task.cancel()
+            try:
+                await say_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         for t in self._tasks:
             t.cancel()
         for t in self._tasks:
