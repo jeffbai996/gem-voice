@@ -191,3 +191,108 @@ async def test_encode_loop_survives_bad_frame(base_config, monkeypatch):
     assert ev.data["b64"]
     assert s._opus_encode_dropped == 1
 
+
+# --------------------------------------------------------------------------
+# Barge-in: a new /voice speak utterance CANCELS the in-flight one instead of
+# queueing behind it. Each test stubs _do_say with a controllable coroutine so
+# we exercise the cancel/flush wiring without real TTS I/O.
+# --------------------------------------------------------------------------
+
+
+def _instrumented_do_say(events: list[str]):
+    """Build a fake _do_say that records start/cancel and blocks until cancelled,
+    so a second say() must interrupt it. `events` accumulates a trace."""
+    async def fake(self, text, voice=None):  # noqa: ANN001 — matches _do_say sig
+        events.append(f"start:{text}")
+        try:
+            await asyncio.sleep(3600)  # "playing" — only ends via cancel
+        except asyncio.CancelledError:
+            events.append(f"cancel:{text}")
+            raise
+        finally:
+            events.append(f"done:{text}")
+    return fake
+
+
+async def _drain_flush_events(s) -> int:
+    """Count AUDIO_FLUSH events currently queued without blocking."""
+    from gem_voice.types import SessionEventType
+    n = 0
+    while not s._events.empty():
+        ev = s._events.get_nowait()
+        if ev.type == SessionEventType.AUDIO_FLUSH:
+            n += 1
+    return n
+
+
+@pytest.mark.asyncio
+async def test_second_say_cancels_the_first(base_config, monkeypatch):
+    """A say() arriving while one is in flight cancels the first and starts the
+    second (barge-in), instead of serializing behind it."""
+    trace: list[str] = []
+    monkeypatch.setattr(Session, "_do_say", _instrumented_do_say(trace))
+
+    s = Session(base_config)
+    await s.say("first")
+    await asyncio.sleep(0.02)  # let the first say task start
+    assert "start:first" in trace
+
+    await s.say("second")
+    await asyncio.sleep(0.02)  # let the cancel land + second start
+    assert "cancel:first" in trace
+    assert "start:second" in trace
+
+    # Clean up the still-running second say.
+    await s.cancel_say()
+
+
+@pytest.mark.asyncio
+async def test_barge_in_emits_audio_flush(base_config, monkeypatch):
+    """When a new say preempts a playing one, an AUDIO_FLUSH event is emitted so
+    the parent drops its banked/playing frames (otherwise the old audio keeps
+    playing on the wire for ~a second)."""
+    trace: list[str] = []
+    monkeypatch.setattr(Session, "_do_say", _instrumented_do_say(trace))
+
+    s = Session(base_config)
+    await s.say("first")
+    await asyncio.sleep(0.02)
+    # First say should not itself have flushed.
+    assert await _drain_flush_events(s) == 0
+
+    await s.say("second")
+    await asyncio.sleep(0.02)
+    assert await _drain_flush_events(s) == 1
+
+    await s.cancel_say()
+
+
+@pytest.mark.asyncio
+async def test_cancel_say_stops_inflight_and_flushes(base_config, monkeypatch):
+    """cancel_say() with a say in flight cancels it and emits a flush."""
+    trace: list[str] = []
+    monkeypatch.setattr(Session, "_do_say", _instrumented_do_say(trace))
+
+    s = Session(base_config)
+    await s.say("hello")
+    await asyncio.sleep(0.02)
+    assert "start:hello" in trace
+
+    cancelled = await s.cancel_say()
+    await asyncio.sleep(0.02)
+    assert cancelled is True
+    assert "cancel:hello" in trace
+    assert await _drain_flush_events(s) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_say_noop_when_nothing_playing(base_config, monkeypatch):
+    """cancel_say() with no active say returns False and emits no flush."""
+    trace: list[str] = []
+    monkeypatch.setattr(Session, "_do_say", _instrumented_do_say(trace))
+
+    s = Session(base_config)
+    cancelled = await s.cancel_say()
+    assert cancelled is False
+    assert await _drain_flush_events(s) == 0
+

@@ -42,6 +42,7 @@ class _SessionManagerProto(Protocol):
     async def push_tool_response(self, call_id: str, name: str,
                                  response: dict) -> bool: ...
     async def say(self, text: str, voice: str | None = None) -> None: ...
+    async def cancel_say(self) -> bool: ...
     @property
     def events(self) -> asyncio.Queue: ...
 
@@ -130,6 +131,8 @@ class IpcServer:
             return await self._handle_tool_response(req_id, msg)
         if action == "say":
             return self._handle_say(req_id, msg)
+        if action == "cancel_say":
+            return await self._handle_cancel_say(req_id)
         if action == "think":
             return self._handle_think(req_id, msg)
         return {"id": req_id, "ok": False, "error": f"unknown action: {action!r}"}
@@ -147,6 +150,13 @@ class IpcServer:
             voice = None
         asyncio.create_task(self.sm.say(text, voice))
         return {"id": req_id, "ok": True}
+
+    async def _handle_cancel_say(self, req_id: str) -> dict[str, Any]:
+        """Full barge-in: stop any in-flight speak-mode utterance and flush the
+        parent's playback NOW. The parent sends this the moment a new message
+        arrives mid-turn, before its replacement reply is even synthesized."""
+        cancelled = await self.sm.cancel_say()
+        return {"id": req_id, "ok": True, "cancelled": cancelled}
 
     def _handle_think(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
         """No-op. The 'thinking tone' was removed, but the parent bot may still

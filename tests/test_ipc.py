@@ -66,6 +66,16 @@ class _FakeSessionManager:
         self.pushed_video = getattr(self, 'pushed_video', [])
         self.pushed_video.append(frame)
 
+    async def say(self, text, voice=None) -> None:
+        self.said = getattr(self, "said", [])
+        self.said.append((text, voice))
+
+    async def cancel_say(self) -> bool:
+        self.cancel_say_called = getattr(self, "cancel_say_called", 0) + 1
+        # Report "something was playing" iff a say has been issued — lets the
+        # IPC test assert the returned `cancelled` flag round-trips.
+        return bool(getattr(self, "said", []))
+
     @property
     def events(self) -> asyncio.Queue:
         return self._events
@@ -323,5 +333,43 @@ async def test_tool_response_tolerates_string_result(short_sock_path):
         })
         assert resp["ok"] is True
         assert sm.tool_responses[-1][2] == {"result": "plain string"}
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_say_then_cancel_say_routes_to_session(short_sock_path):
+    """`say` reaches the session, and `cancel_say` calls cancel_say() and round-
+    trips the `cancelled` flag — the IPC half of speak-mode barge-in."""
+    sock = short_sock_path
+    sm = _FakeSessionManager()
+    server = IpcServer(socket_path=sock, session_manager=sm)
+    await server.start()
+    try:
+        say_resp = await _send_recv(sock, {
+            "action": "say", "id": "s1", "text": "hello there", "voice": "Aoede",
+        })
+        assert say_resp == {"id": "s1", "ok": True}
+        # Give the fire-and-forget say task a tick to land on the fake SM.
+        await asyncio.sleep(0.02)
+        assert sm.said[-1] == ("hello there", "Aoede")
+
+        cancel_resp = await _send_recv(sock, {"action": "cancel_say", "id": "c1"})
+        assert cancel_resp == {"id": "c1", "ok": True, "cancelled": True}
+        assert sm.cancel_say_called == 1
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancel_say_when_nothing_playing(short_sock_path):
+    """cancel_say with no prior say returns cancelled=False."""
+    sock = short_sock_path
+    sm = _FakeSessionManager()
+    server = IpcServer(socket_path=sock, session_manager=sm)
+    await server.start()
+    try:
+        resp = await _send_recv(sock, {"action": "cancel_say", "id": "c2"})
+        assert resp == {"id": "c2", "ok": True, "cancelled": False}
     finally:
         await server.stop()
