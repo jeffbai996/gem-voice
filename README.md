@@ -6,11 +6,13 @@ Token-agnostic Discord voice subprocess. Bring your own bot identity; gem-voice 
 
 gem-voice is a long-running daemon that any Discord bot can delegate voice work to. The parent bot owns the Discord identity and the main gateway connection; gem-voice opens the voice WebSocket using per-call credentials handed over a unix-socket IPC, plumbs audio bidirectionally between Discord and a realtime LLM, and emits events back to the parent.
 
+Two modes: a **live call** (`join`/`leave`), full duplex audio+video with the model in real time, and **speak** (`say`/`cancel_say`), a lighter one-shot TTS path for `/voice speak` — the parent hands over text, gem-voice streams it back as audio without opening a full Live session.
+
 One audio process, many parent bots.
 
 ## Status
 
-v0.1 — under development. Unit-tested across all modules; manual smoke test against a real Discord voice channel is the next milestone.
+79 unit tests passing across all modules. Live-call mode has been smoke-tested against real Discord voice channels; speak-mode ships with pipelined TTS (parallel chunk synthesis, sentence-level chunking, realtime pacing) and barge-in cancellation (a new message cuts off an in-flight utterance). Session resumption survives Gemini `goAway`/timeout events. Tool calls can be bridged over IPC so the parent's tools are reachable mid-call.
 
 ## Requirements
 
@@ -53,11 +55,13 @@ they fire (`idle_timeout` or `hard_max_duration`):
   of activity (default `1800`, i.e. 30 minutes). Backstop against
   unexpectedly long sessions.
 
+These guardrails apply to `join`/`leave` live sessions. `say` (speak-mode) is one-shot TTS with no open session to leak — its cost is bounded by the text length per call.
+
 ## IPC protocol
 
-Newline-delimited JSON over unix socket. Three commands:
+Newline-delimited JSON over unix socket. Nine actions:
 
-**`join`** — start a voice session
+**`join`** — start a live voice session
 
 ```json
 {
@@ -88,6 +92,22 @@ Newline-delimited JSON over unix socket. Three commands:
 ```json
 {"id": "req-003", "action": "status"}
 ```
+
+**`audio_in`** / **`video_in`** — stream a frame into an active live session (opus audio frame / video frame for continuous-watch mode). Sent repeatedly while the parent is forwarding Discord voice/video to gem-voice.
+
+**`tool_response`** — return the result of a tool call gem-voice dispatched over IPC mid-session (see tool-call bridge below).
+
+**`say`** — one-shot TTS, independent of `join`/`leave`. Synthesizes `text` and streams it back as `audio_out`, fire-and-forget so a multi-second synthesis never blocks the IPC loop. Powers `/voice speak`.
+
+```json
+{"id": "req-004", "action": "say", "text": "it's sunny out", "voice": "Aoede"}
+```
+
+`voice` is optional — a per-utterance override of the configured default (backs `/voice type`).
+
+**`cancel_say`** — barge-in: cut off an in-flight `say` synthesis/playback, e.g. because a new message superseded it.
+
+**`think`** — emit a soft thinking-tone audio cue while the model is generating, so speak-mode doesn't sit in dead silence.
 
 While a session is active, gem-voice pushes events on the same socket:
 
