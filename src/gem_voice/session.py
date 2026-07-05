@@ -535,8 +535,8 @@ class Session:
 
     async def _compose_persona(self, persona: Persona) -> Persona:
         new_prompt = persona.system_prompt
-        # Always tell voice Gemma the current time — she was blind to "now"
-        # and hallucinating dates. host-a runs in Springfield (local tz).
+        # Always tell the voice model the current time so relative dates are
+        # grounded in the host's configured local time zone.
         _now = datetime.datetime.now().astimezone().strftime("%A, %B %d %Y, %-I:%M %p %Z")
         new_prompt = (f'{new_prompt}\n\nThe current date and time is {_now}. '
                       'Treat this as "now" — do not guess the date.')

@@ -70,7 +70,9 @@ class _FakeGeminiLive:
         self._persona = persona
         self._model_config = model_config
 
-    async def stream(self, pcm_in, pcm_out, events):
+    async def stream(self, pcm_in, pcm_out, events, video_in=None):
+        # video_in mirrors GeminiLive.stream()'s kwarg (7fe90d4) — the fake
+        # ignores frames; accepting it keeps this double signature-compatible.
         while True:
             try:
                 frame = await pcm_in.get()
