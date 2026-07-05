@@ -89,21 +89,31 @@ async def test_connect_passes_persona_and_model(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stream_forwards_pcm_in_and_collects_pcm_out(monkeypatch):
+    # NB: bare MagicMocks poison the wrapper's feature-detection getattrs —
+    # session_resumption_update/tool_call/go_away auto-mock as TRUTHY, the
+    # sru branch swallows the response (`continue`) and pcm_out never fills
+    # (the 2026-07-05 suite hang). Pin every probed attr explicitly.
     fake_session = _FakeLiveSession(replay=[
-        MagicMock(server_content=MagicMock(
-            model_turn=MagicMock(parts=[
-                MagicMock(inline_data=MagicMock(data=b"\xaa" * 100, mime_type="audio/pcm"))
-            ]),
-            input_transcription=None,
-            output_transcription=None,
-            turn_complete=False,
-        )),
-        MagicMock(server_content=MagicMock(
-            turn_complete=True,
-            model_turn=None,
-            input_transcription=None,
-            output_transcription=None,
-        )),
+        MagicMock(
+            session_resumption_update=None, tool_call=None,
+            go_away=None, setup_complete=None,
+            server_content=MagicMock(
+                model_turn=MagicMock(parts=[
+                    MagicMock(inline_data=MagicMock(data=b"\xaa" * 100, mime_type="audio/pcm"))
+                ]),
+                input_transcription=None,
+                output_transcription=None,
+                turn_complete=False,
+            )),
+        MagicMock(
+            session_resumption_update=None, tool_call=None,
+            go_away=None, setup_complete=None,
+            server_content=MagicMock(
+                turn_complete=True,
+                model_turn=None,
+                input_transcription=None,
+                output_transcription=None,
+            )),
     ])
 
     monkeypatch.setattr(
