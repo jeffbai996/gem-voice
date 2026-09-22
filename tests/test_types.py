@@ -39,7 +39,7 @@ def test_persona_with_optional_memory_query():
 
 def test_model_config_defaults():
     m = ModelConfig()
-    assert m.model == "gemini-3.1-flash-live-preview"
+    assert m.model is None
     assert m.voice == "Aoede"
     assert m.language == "en-US"
 

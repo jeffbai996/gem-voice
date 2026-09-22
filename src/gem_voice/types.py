@@ -34,10 +34,37 @@ class Persona:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Per-call model selection. Defaults match Config defaults."""
-    model: str = "gemini-3.1-flash-live-preview"
+    """Per-call selection; an omitted model inherits the daemon configuration."""
+    model: str | None = None
     voice: str = "Aoede"
     language: str = "en-US"
+
+
+    silence_ms: int = 700
+    prefix_ms: int = 100
+    start_sensitivity: str = "low"
+    end_sensitivity: str = "low"
+    interrupt: bool = True
+    thinking: str = "minimal"
+    temperature: float | None = None
+    max_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for key, low, high in [("silence_ms", 100, 3000), ("prefix_ms", 0, 1000),
+                                ("temperature", 0, 2), ("max_tokens", 1, 8192)]:
+            value = getattr(self, key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or not low <= value <= high
+                                      or (key != "temperature" and not isinstance(value, int))):
+                raise ValueError(f"invalid {key}")
+        if self.thinking not in {"minimal", "low", "medium", "high"}:
+            raise ValueError("invalid thinking level")
+        if self.start_sensitivity not in {"low", "high"} or self.end_sensitivity not in {"low", "high"}:
+            raise ValueError("invalid speech sensitivity")
+        if not isinstance(self.interrupt, bool):
+            raise ValueError("invalid interruption setting")
+        if self.model == "gemini-3.8-live-extended-thinking" and self.thinking == "minimal":
+            raise ValueError("extended thinking requires low, medium, or high")
 
 
 class SessionEventType(str, Enum):

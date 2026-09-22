@@ -41,7 +41,7 @@ class _SessionManagerProto(Protocol):
     def push_video_frame(self, frame: bytes) -> None: ...
     async def push_tool_response(self, call_id: str, name: str,
                                  response: dict) -> bool: ...
-    async def say(self, text: str, voice: str | None = None) -> None: ...
+    async def say(self, text: str, voice: str | None = None, tts_config: dict | None = None) -> None: ...
     async def cancel_say(self) -> bool: ...
     @property
     def events(self) -> asyncio.Queue: ...
@@ -148,7 +148,16 @@ class IpcServer:
         voice = msg.get("voice")
         if not isinstance(voice, str) or not voice.strip():
             voice = None
-        asyncio.create_task(self.sm.say(text, voice))
+        tts = msg.get("tts_config")
+        if tts is not None:
+            if not isinstance(tts, dict) or set(tts) - {"model", "style"}:
+                return {"id": req_id, "ok": False, "error": "invalid TTS settings"}
+            if tts.get("model") is not None and tts["model"] not in {
+                "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts", "gemini-3.1-flash-tts-preview"}:
+                return {"id": req_id, "ok": False, "error": "unknown TTS model"}
+            if not isinstance(tts.get("style", ""), str) or len(tts.get("style", "")) > 500:
+                return {"id": req_id, "ok": False, "error": "invalid TTS style"}
+        asyncio.create_task(self.sm.say(text, voice, tts) if tts else self.sm.say(text, voice))
         return {"id": req_id, "ok": True}
 
     async def _handle_cancel_say(self, req_id: str) -> dict[str, Any]:
@@ -172,7 +181,7 @@ class IpcServer:
             tools = msg.get("tools") or None
             if tools is not None and not isinstance(tools, list):
                 raise TypeError("tools must be a list of declarations")
-        except (KeyError, TypeError) as e:
+        except (KeyError, TypeError, ValueError) as e:
             return {"id": req_id, "ok": False, "error": f"bad join payload: {e}"}
 
         try:

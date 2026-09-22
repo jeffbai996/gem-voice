@@ -59,8 +59,19 @@ def _build_live_config(persona: Persona, model_config: ModelConfig,
                     voice_name=model_config.voice
                 )
             ),
-            language_code=model_config.language,
         ),
+        realtime_input_config=genai_types.RealtimeInputConfig(
+            automatic_activity_detection=genai_types.AutomaticActivityDetection(
+                disabled=False,
+                start_of_speech_sensitivity="START_SENSITIVITY_" + model_config.start_sensitivity.upper(),
+                end_of_speech_sensitivity="END_SENSITIVITY_" + model_config.end_sensitivity.upper(),
+                prefix_padding_ms=model_config.prefix_ms,
+                silence_duration_ms=model_config.silence_ms,
+            ),
+            activity_handling="START_OF_ACTIVITY_INTERRUPTS" if model_config.interrupt else "NO_INTERRUPTION",
+        ),
+        temperature=model_config.temperature,
+        max_output_tokens=model_config.max_tokens,
         output_audio_transcription=genai_types.AudioTranscriptionConfig(),
         input_audio_transcription=genai_types.AudioTranscriptionConfig(),
         # Enable session resumption so the server streams us resumption handles.
@@ -70,6 +81,8 @@ def _build_live_config(persona: Persona, model_config: ModelConfig,
         session_resumption=genai_types.SessionResumptionConfig(
             handle=resume_handle),
     )
+    if model_config.model != "gemini-3.8-live":
+        cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_level=model_config.thinking)
     # Continuous-watch video config — GATED behind GEM_VOICE_VIDEO so audio-only
     # calls are byte-identical to before. When on: cap frame detail (cost/latency)
     # and add sliding-window context compression, which is what lets an
@@ -166,32 +179,31 @@ class GeminiLiveSession:
 
         async def _send_loop():
             frame_count = 0
-            # Frames sent since the last audio_stream_end. Discord stops
-            # shipping opus the moment the speaker goes quiet (no comfort
-            # noise), so Gemini's server-side VAD never hears trailing
-            # silence and waits forever for the utterance to end — session
-            # alive, model mute. When the frame stream pauses longer than
-            # the gap threshold, tell Gemini the audio stream ended so it
-            # commits the turn and replies.
+            # Discord stops delivering frames in pauses. Feed silence at wall-clock
+            # pace so server VAD sees the configured silence duration. Stream end
+            # is a longer-gap flush, never an earlier competing turn cutoff.
             sent_since_end = 0
-            gap_s = float(os.environ.get("GEM_VOICE_UTTERANCE_GAP_S", "0.6"))
+            quiet_ms = 0
+            flush_ms = max(1200, self._model_config.silence_ms + 500)
             while True:
                 try:
                     if sent_since_end:
-                        frame = await asyncio.wait_for(pcm_in.get(),
-                                                       timeout=gap_s)
+                        frame = await asyncio.wait_for(pcm_in.get(), timeout=0.02)
                     else:
                         frame = await pcm_in.get()
+                    quiet_ms = 0
                 except asyncio.TimeoutError:
+                    quiet_ms += 20
                     try:
-                        await self._session.send_realtime_input(
-                            audio_stream_end=True)
-                        log.info("gemini_audio_stream_end",
-                                 extra={"after_frames": sent_since_end})
+                        if quiet_ms >= flush_ms:
+                            await self._session.send_realtime_input(audio_stream_end=True)
+                            sent_since_end = 0
+                            log.info("gemini_audio_stream_end", extra={"quiet_ms": quiet_ms})
+                        else:
+                            await self._session.send_realtime_input(
+                                audio=genai_types.Blob(data=bytes(640), mime_type="audio/pcm;rate=16000"))
                     except Exception as e:
-                        log.warning("gemini_stream_end_failed",
-                                    extra={"error": str(e)})
-                    sent_since_end = 0
+                        log.warning("gemini_silence_send_failed", extra={"error": str(e)})
                     continue
                 if frame is None:
                     # Stop sentinel from session.py = deliberate teardown.

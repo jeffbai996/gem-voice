@@ -135,7 +135,7 @@ class Session:
                         extra={"tool_name": name, "error": str(e)})
             return False
 
-    async def say(self, text: str, voice: str | None = None) -> None:
+    async def say(self, text: str, voice: str | None = None, tts_config: dict | None = None) -> None:
         """Speak `text`, BARGING IN over any utterance currently playing.
 
         If a say is already in flight, cancel it and flush the parent's playback
@@ -148,7 +148,7 @@ class Session:
         # parent drops banked + in-flight frames; without it the old audio keeps
         # playing on the wire for ~a second after we stop emitting.
         await self._cancel_active_say()
-        self._active_say_task = asyncio.create_task(self._say_guarded(text, voice))
+        self._active_say_task = asyncio.create_task(self._say_guarded(text, voice, tts_config))
 
     async def cancel_say(self) -> bool:
         """Stop any in-flight say and flush the parent's playback. Returns True if
@@ -175,17 +175,20 @@ class Session:
         await self._events.put(SessionEvent(type=SessionEventType.AUDIO_FLUSH, data={}))
         return True
 
-    async def _say_guarded(self, text: str, voice: str | None = None) -> None:
+    async def _say_guarded(self, text: str, voice: str | None = None, tts_config: dict | None = None) -> None:
         """Run one _do_say with a guard so a TTS error doesn't escape as an
         unhandled task exception. Cancellation (barge-in) propagates cleanly."""
         try:
-            await self._do_say(text, voice)
+            if tts_config:
+                await self._do_say(text, voice, tts_config)
+            else:
+                await self._do_say(text, voice)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — one bad say mustn't crash the daemon
             log.warning("say_item_failed", extra={"error": str(e)})
 
-    async def _do_say(self, text: str, voice: str | None = None) -> None:
+    async def _do_say(self, text: str, voice: str | None = None, tts_config: dict | None = None) -> None:
         """Speak `text` in gem-voice's configured voice via Gemini TTS, emitting
         it as AUDIO_OUT frames over the SAME encode/broadcast path the live model
         uses — so it sounds identical. Drives /voice speak (text-driven): the
@@ -221,7 +224,8 @@ class Session:
             return out or [s]
 
         chunks = _chunk_for_tts(text)
-        model = os.environ.get("GEM_VOICE_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+        model = (tts_config or {}).get("model") or os.environ.get("GEM_VOICE_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+        style = (tts_config or {}).get("style", "")
 
         def _synthesize(segment: str) -> bytes:
             # Gemini TTS shares the exact prebuilt voice set as Gemini Live, so
@@ -233,7 +237,7 @@ class Session:
             from google.genai import types as gt
             client = genai.Client(api_key=self._config.gemini_api_key)
             resp = client.models.generate_content(
-                model=model, contents=segment,
+                model=model, contents=(f"Delivery instructions: {style}\nRead only the following transcript:\n{segment}" if style else segment),
                 config=gt.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=gt.SpeechConfig(
@@ -395,13 +399,9 @@ class Session:
         if self._active_session_id is not None:
             raise SessionAlreadyActiveError("session already active")
 
-        # The IPC join payload from the Node side may omit the model (or carry
-        # ModelConfig's stale dataclass default, which is a since-deprecated
-        # Live model id). The daemon — not the caller — owns its model: fall
-        # back to GEMINI_MODEL from config whenever the caller didn't send a
-        # real override. Without this, every join used the dead default and
-        # Gemini rejected the connection with a 1008 "model not found".
-        if not model_config.model or model_config.model == ModelConfig().model:
+        # An explicit model selection must win even when it matches an old
+        # default. Only an omitted model inherits the daemon configuration.
+        if not model_config.model:
             model_config = replace(model_config, model=self._config.gemini_model)
             log.info("model_override_from_config", extra={"model": model_config.model})
 
