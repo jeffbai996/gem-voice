@@ -81,6 +81,8 @@ Newline-delimited JSON over unix socket. Nine actions:
 }
 ```
 
+`model_config` fields are all optional. Omit `model` to use the daemon's `GEMINI_MODEL`. Voice tuning: `silence_ms` (100-3000, default 700), `prefix_ms` (0-1000, default 100), `start_sensitivity` / `end_sensitivity` (`low`|`high`, default `low`), `interrupt` (bool, default true), `thinking` (`minimal`|`low`|`medium`|`high`, default `minimal`; `gemini-3.8-live-extended-thinking` requires non-minimal), `temperature` (0-2), `max_tokens` (1-8192). Out-of-range values reject the join with `bad join payload`.
+
 **`leave`** — end the active session
 
 ```json
@@ -103,7 +105,7 @@ Newline-delimited JSON over unix socket. Nine actions:
 {"id": "req-004", "action": "say", "text": "it's sunny out", "voice": "Aoede"}
 ```
 
-`voice` is optional — a per-utterance override of the configured default (backs `/voice type`).
+`voice` is optional — a per-utterance override of the configured default (backs `/voice type`). `tts_config` is also optional: `{"model": "<tts model>", "style": "<delivery instructions, max 500 chars>"}`; `model` must be one of `gemini-2.5-flash-preview-tts`, `gemini-2.5-pro-preview-tts`, `gemini-3.1-flash-tts-preview` (falls back to `GEM_VOICE_TTS_MODEL`).
 
 **`cancel_say`** — barge-in: cut off an in-flight `say` synthesis/playback, e.g. because a new message superseded it.
 
