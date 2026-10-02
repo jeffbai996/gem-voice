@@ -323,3 +323,59 @@ async def test_tts_model_and_delivery_style_reach_synthesis(base_config, monkeyp
     assert 'Speak slowly' in request['contents']
     assert 'Hello.' in request['contents']
     assert request['config'].speech_config.voice_config.prebuilt_voice_config.voice_name == 'Kore'
+
+@pytest.mark.asyncio
+async def test_stop_cancels_speak_even_without_a_live_call(base_config, monkeypatch):
+    trace = []
+    monkeypatch.setattr(Session, "_do_say", _instrumented_do_say(trace))
+    session = Session(base_config)
+    await session.say("utterance")
+    await asyncio.sleep(0)
+    assert session.status().active_session is None
+    await session.stop()
+    assert "cancel:utterance" in trace
+    assert session._active_say_task is None
+
+@pytest.mark.asyncio
+async def test_watchdog_teardown_does_not_cancel_itself_before_closing_provider(base_config):
+    session = Session(base_config)
+    session._active_session_id = "session-test"
+    provider = AsyncMock()
+    session._gemini = provider
+    session._hard_max_s = 0
+    task = asyncio.create_task(session._timeout_watchdog("session-test", 0))
+    session._tasks = [task]
+    await asyncio.wait_for(task, 2)
+    provider.close.assert_awaited_once()
+    assert session.status().active_session is None
+
+@pytest.mark.asyncio
+async def test_overlapping_teardown_closes_provider_once(base_config):
+    session = Session(base_config)
+    session._active_session_id = "session-test"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    async def close():
+        entered.set()
+        await release.wait()
+    provider = AsyncMock()
+    provider.close.side_effect = close
+    session._gemini = provider
+    first = asyncio.create_task(session._teardown())
+    await entered.wait()
+    second = asyncio.create_task(session.stop())
+    await asyncio.sleep(0)
+    assert provider.close.await_count == 1
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 1)
+    assert provider.close.await_count == 1
+
+@pytest.mark.asyncio
+async def test_leave_discards_queued_tool_calls_and_audio_before_the_next_join(base_config):
+    from gem_voice.types import SessionEvent, SessionEventType
+    session = Session(base_config)
+    session._active_session_id = "session-old"
+    await session.events.put(SessionEvent(type=SessionEventType.TOOL_CALL, data={"call_id": "old-tool"}))
+    await session.events.put(SessionEvent(type=SessionEventType.AUDIO_OUT, data={"b64": "old-audio"}))
+    await session.stop()
+    assert session.events.empty()

@@ -4,15 +4,17 @@ Token-agnostic Discord voice subprocess. Bring your own bot identity; gem-voice 
 
 ## What it does
 
-gem-voice is a long-running daemon that any Discord bot can delegate voice work to. The parent bot owns the Discord identity and the main gateway connection; gem-voice opens the voice WebSocket using per-call credentials handed over a unix-socket IPC, plumbs audio bidirectionally between Discord and a realtime LLM, and emits events back to the parent.
+gem-voice is a long-running daemon that any Discord bot can delegate voice work to. The parent bot owns the Discord identity, gateway and voice connection. It forwards Opus frames over unix-socket IPC; gem-voice decodes/encodes audio, owns the realtime model session and emits events back to the parent.
 
 Two modes: a **live call** (`join`/`leave`), full duplex audio+video with the model in real time, and **speak** (`say`/`cancel_say`), a lighter one-shot TTS path for `/voice speak` — the parent hands over text, gem-voice streams it back as audio without opening a full Live session.
 
-One audio process, many parent bots.
+One audio process with one owning parent connection at a time. A second client
+is rejected while the owner is connected; its disconnect cannot stop the owner.
+Use the owning connection for status requests during a call.
 
 ## Status
 
-79 unit tests passing across all modules. Live-call mode has been smoke-tested against real Discord voice channels; speak-mode ships with pipelined TTS (parallel chunk synthesis, sentence-level chunking, realtime pacing) and barge-in cancellation (a new message cuts off an in-flight utterance). Session resumption survives Gemini `goAway`/timeout events. Tool calls can be bridged over IPC so the parent's tools are reachable mid-call.
+Unit and fake-backend integration tests cover the modules. Live-call mode has been smoke-tested against real Discord voice channels; speak-mode ships with pipelined TTS (parallel chunk synthesis, sentence-level chunking, realtime pacing) and barge-in cancellation (a new message cuts off an in-flight utterance). Session resumption survives Gemini `goAway`/timeout events. Tool calls can be bridged over IPC so the parent's tools are reachable mid-call.
 
 ## Requirements
 
@@ -67,14 +69,6 @@ Newline-delimited JSON over unix socket. Nine actions:
 {
   "id": "req-001",
   "action": "join",
-  "vc_credentials": {
-    "guild_id": "...",
-    "channel_id": "...",
-    "user_id": "...",
-    "session_id": "...",
-    "endpoint": "us-east-1234.discord.media:443",
-    "token": "..."
-  },
   "owner_user_id": "...",
   "persona": {"name": "MyBot", "system_prompt": "You are MyBot."},
   "model_config": {"model": "gemini-3.1-flash-live-preview", "voice": "Aoede", "language": "en-US"}
@@ -121,17 +115,16 @@ While a session is active, gem-voice pushes events on the same socket:
 
 ## Parent bot integration example
 
-Your bot intercepts a `/voice join` slash command, captures the voice credentials from `VOICE_STATE_UPDATE` and `VOICE_SERVER_UPDATE` events on its main gateway, and sends them to gem-voice:
+Your bot joins Discord voice using its own voice library, sends persona/model settings to gem-voice, and forwards Opus frames over the same connection:
 
 ```python
 import asyncio, json
 
-async def delegate_to_gem_voice(creds, persona):
+async def delegate_to_gem_voice(persona):
     reader, writer = await asyncio.open_unix_connection("/tmp/gem-voice.sock")
     payload = {
         "id": "1",
         "action": "join",
-        "vc_credentials": creds,
         "owner_user_id": "...",
         "persona": persona,
         "model_config": {},
@@ -148,7 +141,7 @@ async def delegate_to_gem_voice(creds, persona):
 ## Test
 
 ```bash
-pytest -q                       # all unit tests
+pytest -q -m "not slow"         # unit + fake-backend integration tests
 pytest -m integration -q        # integration tests
 pytest -m slow                  # real network tests (rare)
 ```
@@ -160,3 +153,25 @@ See `systemd/gem-voice.service` for an example unit file with resource limits (`
 ## License
 
 MIT
+
+## Lifecycle and deployment
+
+Disconnecting the owning IPC client stops its live session and pending speak
+playback. `leave` also cancels speak-mode TTS when no live call is open. Provider
+requests already running in a synthesis thread may finish; cancellation stops
+subsequent playback and queued synthesis, not an already accepted remote request.
+
+A `tool_response` may carry the `session_id` returned by `join`. A mismatched ID
+is rejected so a delayed completion cannot enter a replacement call. Existing
+clients omitting the field remain compatible; updated clients should send it.
+Terminal session events include their session ID.
+
+Land changes through the repository's test gate (`.cc-land.json`) using the
+existing serialized landing tool. The default gate excludes real-network `slow`
+tests and uses `src` from the tested checkout. Before deployment, inspect voice
+activity using the owning parent or passive service logs. Allow active calls and
+speak playback to settle; do not probe an older daemon by connecting another
+client, since older versions can transfer ownership or stop a call on disconnect.
+Advance a clean runtime checkout to the landed revision, restart the daemon only
+when idle, and verify its new PID, source revision and ready log. The parent bot
+has a separate release procedure; deploy a compatible daemon first.

@@ -373,3 +373,87 @@ async def test_cancel_say_when_nothing_playing(short_sock_path):
         assert resp == {"id": "c2", "ok": True, "cancelled": False}
     finally:
         await server.stop()
+
+@pytest.mark.asyncio
+async def test_second_client_cannot_replace_owner_or_stop_its_session(short_sock_path):
+    sm = _FakeSessionManager()
+    server = IpcServer(short_sock_path, sm)
+    await server.start()
+    r1, w1 = await asyncio.open_unix_connection(short_sock_path)
+    try:
+        w1.write((json.dumps({"id": "first", "action": "join", "owner_user_id": "alice",
+                             "persona": {"name": "Example", "system_prompt": "Example"}}) + "\n").encode())
+        await w1.drain()
+        assert json.loads(await r1.readline())["ok"] is True
+        r2, w2 = await asyncio.open_unix_connection(short_sock_path)
+        try:
+            w2.write(b'{"id":"second","action":"leave"}\n')
+            await w2.drain()
+            response = json.loads(await r2.readline())
+            assert response["ok"] is False
+            assert sm._active == "sess-test"
+        finally:
+            w2.close()
+            await w2.wait_closed()
+        await asyncio.sleep(0)
+        assert sm._active == "sess-test"
+        assert not sm.leave_called
+    finally:
+        w1.close()
+        await w1.wait_closed()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_tool_response_for_an_old_session_is_rejected():
+    sm = _FakeSessionManager()
+    sm._active = "session-b"
+    server = IpcServer("unused", sm)
+    response = await server._dispatch(json.dumps({"id": "tool", "action": "tool_response",
+        "session_id": "session-a", "call_id": "old-tool", "name": "inspect", "response": {"result": "private"}}).encode())
+    assert response["ok"] is False
+    assert not getattr(sm, "tool_responses", [])
+
+@pytest.mark.asyncio
+async def test_server_shutdown_closes_accepted_clients_and_cleans_up(short_sock_path):
+    sm = _FakeSessionManager()
+    server = IpcServer(short_sock_path, sm)
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(short_sock_path)
+    writer.write(b'{"id":"status","action":"status"}\n')
+    await writer.drain()
+    assert json.loads(await reader.readline())["ok"] is True
+    await server.stop()
+    assert await asyncio.wait_for(reader.read(), 1) == b""
+    assert sm.leave_called
+    assert not server._clients
+    writer.close()
+    await writer.wait_closed()
+
+@pytest.mark.asyncio
+async def test_shutdown_during_join_cancels_setup_and_closes_provider(short_sock_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from gem_voice.session import Session
+    from gem_voice.types import Config
+    entered = asyncio.Event()
+    async def connect(*args):
+        entered.set()
+        await asyncio.Future()
+    provider = AsyncMock()
+    provider.connect.side_effect = connect
+    monkeypatch.setattr("gem_voice.session._make_gemini_session", lambda key: provider)
+    session = Session(Config(gemini_api_key="fake-key", discord_owner_user_id="alice"))
+    server = IpcServer(short_sock_path, session)
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(short_sock_path)
+    writer.write((json.dumps({"id": "join", "action": "join", "owner_user_id": "alice",
+                             "persona": {"name": "Example", "system_prompt": "Example"}}) + "\n").encode())
+    await writer.drain()
+    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(server.stop(), 1)
+    await session.stop()
+    provider.close.assert_awaited_once()
+    assert session.status().active_session is None
+    assert await asyncio.wait_for(reader.read(), 1) == b""
+    writer.close()
+    await writer.wait_closed()

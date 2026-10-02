@@ -72,6 +72,7 @@ class Session:
         self._active_session_id: str | None = None
         self._gemini: GeminiLiveSession | None = None
         self._tasks: list[asyncio.Task] = []
+        self._teardown_lock = asyncio.Lock()
         self._events: asyncio.Queue[SessionEvent] = asyncio.Queue()
         # Speak-mode say BARGE-IN: only ONE say plays at a time, but a new say
         # PREEMPTS the in-flight one instead of queueing behind it. A second
@@ -411,7 +412,7 @@ class Session:
 
         try:
             await self._gemini.connect(composed_persona, model_config, tools)
-        except Exception as e:
+        except (asyncio.CancelledError, Exception) as e:
             log.error("session_start_failed", extra={"error": str(e)})
             await self._teardown()
             raise
@@ -476,7 +477,7 @@ class Session:
                     )
                     await self._events.put(SessionEvent(
                         type=SessionEventType.SESSION_ENDED,
-                        data={"reason": "hard_max_duration", "duration_s": int(now - started_at)},
+                        data={"session_id": sess_id, "reason": "hard_max_duration", "duration_s": int(now - started_at)},
                     ))
                     await self._teardown()
                     return
@@ -487,7 +488,7 @@ class Session:
                     )
                     await self._events.put(SessionEvent(
                         type=SessionEventType.SESSION_ENDED,
-                        data={"reason": "idle_timeout", "idle_s": int(now - self._last_opus_at)},
+                        data={"session_id": sess_id, "reason": "idle_timeout", "idle_s": int(now - self._last_opus_at)},
                     ))
                     await self._teardown()
                     return
@@ -495,43 +496,54 @@ class Session:
             pass
 
     async def stop(self, emit_event: bool = False) -> bool:
-        if self._active_session_id is None:
-            return False
+        was_active = self._active_session_id is not None or self._active_say_task is not None
         log.info("session_stopping", extra={"session_id": self._active_session_id})
+        session_id = self._active_session_id
+        await self._teardown()
+        # Discard pending events from the completed owner before acknowledging
+        # leave. A later join must not inherit its tool calls or audio frames.
+        while not self._events.empty():
+            self._events.get_nowait()
         if emit_event:
             await self._events.put(SessionEvent(
                 type=SessionEventType.SESSION_ENDED,
-                data={"reason": "leave_requested"},
+                data={"session_id": session_id, "reason": "leave_requested"},
             ))
-        await self._teardown()
-        return True
+        return was_active
 
     async def _teardown(self) -> None:
-        # Stop any in-flight speak-mode utterance first so its synth/pacing tasks
-        # don't outlive the session (a /voice leave mid-say used to leak them).
-        say_task = self._active_say_task
-        self._active_say_task = None
-        if say_task is not None and not say_task.done():
-            say_task.cancel()
-            try:
-                await say_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        for t in self._tasks:
-            t.cancel()
-        for t in self._tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._tasks = []
-        if self._gemini is not None:
-            try:
-                await self._gemini.close()
-            except Exception:
-                pass
-        self._gemini = None
-        self._active_session_id = None
+        async with self._teardown_lock:
+            # Stop any in-flight speak-mode utterance first so its synth/pacing tasks
+            # don't outlive the session (a /voice leave mid-say used to leak them).
+            say_task = self._active_say_task
+            self._active_say_task = None
+            if say_task is not None and not say_task.done():
+                say_task.cancel()
+                try:
+                    await say_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            tasks = self._tasks
+            self._tasks = []
+            current = asyncio.current_task()
+            for t in tasks:
+                if t is not current:
+                    t.cancel()
+            for t in tasks:
+                if t is current:
+                    continue
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._tasks = []
+            if self._gemini is not None:
+                try:
+                    await self._gemini.close()
+                except Exception:
+                    pass
+            self._gemini = None
+            self._active_session_id = None
 
     async def _compose_persona(self, persona: Persona) -> Persona:
         new_prompt = persona.system_prompt

@@ -54,6 +54,8 @@ class IpcServer:
         self._server: asyncio.AbstractServer | None = None
         self._broadcaster_task: asyncio.Task | None = None
         self._active_writer: asyncio.StreamWriter | None = None
+        self._clients: set[asyncio.Task] = set()
+        self._closing = False
 
     async def start(self) -> None:
         try:
@@ -68,46 +70,66 @@ class IpcServer:
         log.info("ipc_listening", extra={"socket": self.socket_path})
 
     async def stop(self) -> None:
-        if self._broadcaster_task is not None:
-            self._broadcaster_task.cancel()
-            try:
-                await self._broadcaster_task
-            except asyncio.CancelledError:
-                pass
+        self._closing = True
         if self._server is not None:
             self._server.close()
+        # Accepted clients are not closed by AbstractServer.close(). Settle
+        # their cleanup before stopping event delivery or unlinking the socket.
+        clients = list(self._clients)
+        for task in clients:
+            task.cancel()
+        await asyncio.gather(*clients, return_exceptions=True)
+        if self._server is not None:
             await self._server.wait_closed()
+        if self._broadcaster_task is not None:
+            self._broadcaster_task.cancel()
+            await asyncio.gather(self._broadcaster_task, return_exceptions=True)
         try:
             os.unlink(self.socket_path)
         except FileNotFoundError:
             pass
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        peer = writer.get_extra_info("peername") or "<unix>"
-        log.info("ipc_client_connected", extra={"peer": str(peer)})
-        self._active_writer = writer
+        task = asyncio.current_task()
+        self._clients.add(task)
+        owns_session = not self._closing and self._active_writer is None
+        if owns_session:
+            self._active_writer = writer
         try:
+            if not owns_session:
+                writer.write(b'{"id":"","ok":false,"error":"another IPC client owns voice"}\n')
+                await writer.drain()
+                return
+            log.info("ipc_client_connected")
             while True:
                 line = await reader.readline()
                 if not line:
-                    break  # EOF
+                    break
                 resp = await self._dispatch(line)
                 writer.write((json.dumps(resp) + "\n").encode())
                 await writer.drain()
-        except (asyncio.CancelledError, ConnectionResetError):
+        except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
             pass
         finally:
-            log.info("ipc_client_disconnected")
-            self._active_writer = None
-            try:
-                await self.sm.stop()
-            except Exception as e:
-                log.warning("session_stop_on_disconnect_failed", extra={"error": str(e)})
+            if owns_session and self._active_writer is writer:
+                try:
+                    await self.sm.stop()
+                except Exception:
+                    log.warning("session_stop_on_disconnect_failed")
+                finally:
+                    if self._active_writer is writer:
+                        self._active_writer = None
+                    # No queued audio/tool event from a disconnected owner may
+                    # be delivered to a later connection.
+                    while not self.sm.events.empty():
+                        self.sm.events.get_nowait()
+                log.info("ipc_client_disconnected")
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
+            self._clients.discard(task)
 
     async def _dispatch(self, line: bytes) -> dict[str, Any]:
         try:
@@ -130,14 +152,14 @@ class IpcServer:
         if action == "tool_response":
             return await self._handle_tool_response(req_id, msg)
         if action == "say":
-            return self._handle_say(req_id, msg)
+            return await self._handle_say(req_id, msg)
         if action == "cancel_say":
             return await self._handle_cancel_say(req_id)
         if action == "think":
             return self._handle_think(req_id, msg)
         return {"id": req_id, "ok": False, "error": f"unknown action: {action!r}"}
 
-    def _handle_say(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
+    async def _handle_say(self, req_id: str, msg: dict[str, Any]) -> dict[str, Any]:
         """/voice speak: TTS `text` and stream it as audio_out. Fire-and-forget
         so a multi-second synthesis never blocks the IPC dispatch loop."""
         text = msg.get("text")
@@ -157,7 +179,7 @@ class IpcServer:
                 return {"id": req_id, "ok": False, "error": "unknown TTS model"}
             if not isinstance(tts.get("style", ""), str) or len(tts.get("style", "")) > 500:
                 return {"id": req_id, "ok": False, "error": "invalid TTS style"}
-        asyncio.create_task(self.sm.say(text, voice, tts) if tts else self.sm.say(text, voice))
+        await (self.sm.say(text, voice, tts) if tts else self.sm.say(text, voice))
         return {"id": req_id, "ok": True}
 
     async def _handle_cancel_say(self, req_id: str) -> dict[str, Any]:
@@ -226,6 +248,9 @@ class IpcServer:
     async def _handle_tool_response(self, req_id: str,
                                     msg: dict[str, Any]) -> dict[str, Any]:
         """Parent finished executing a tool call — feed the result back."""
+        session_id = msg.get("session_id")
+        if session_id is not None and session_id != self.sm.status().active_session:
+            return {"id": req_id, "ok": False, "error": "voice session no longer active"}
         call_id = msg.get("call_id")
         name = msg.get("name")
         response = msg.get("response")
@@ -274,5 +299,5 @@ class IpcServer:
                         log.info("audio_out_broadcast",
                                  extra={"frames_sent": audio_out_sent})
             except (ConnectionResetError, BrokenPipeError) as e:
-                log.warning("ipc_broadcast_failed", extra={"error": str(e)})
-                self._active_writer = None
+                log.warning("ipc_broadcast_failed")
+                writer.close()

@@ -51,8 +51,9 @@ async def _run() -> int:
 
     await stop_event.wait()
     log.info("daemon_stopping")
-    await session_mgr.stop()
+    # Cancel and settle an accepted join before final provider cleanup.
     await server.stop()
+    await session_mgr.stop()
     log.info("daemon_stopped")
     return 0
 
