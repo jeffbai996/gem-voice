@@ -59,6 +59,15 @@ they fire (`idle_timeout` or `hard_max_duration`):
 
 These guardrails apply to `join`/`leave` live sessions. `say` (speak-mode) is one-shot TTS with no open session to leak — its cost is bounded by the text length per call.
 
+Other settings, all optional:
+
+- `GEM_VOICE_VIDEO` — `1` turns on continuous-watch video for live calls (default `0`, audio only).
+- `GEM_VOICE_VIDEO_FPS` — frames per second sent to the model when video is on (default `1`).
+- `GEM_VOICE_VIDEO_QUEUE` — inbound video frames buffered before the oldest are dropped (default `30`).
+- `GEM_VOICE_TTS_MODEL` — default TTS model for `say` (default `gemini-2.5-flash-preview-tts`).
+- `GEM_VOICE_SAY_SYNTH_CONCURRENCY` — TTS chunks synthesized in parallel (default `4`).
+- `GEM_VOICE_SAY_LEAD_S` — audio lead before paced playback starts, in seconds (default `0.3`).
+
 ## IPC protocol
 
 Newline-delimited JSON over unix socket. Nine actions:
@@ -75,7 +84,7 @@ Newline-delimited JSON over unix socket. Nine actions:
 }
 ```
 
-`model_config` fields are all optional. Omit `model` to use the daemon's `GEMINI_MODEL`. Voice tuning: `silence_ms` (100-3000, default 700), `prefix_ms` (0-1000, default 100), `start_sensitivity` / `end_sensitivity` (`low`|`high`, default `low`), `interrupt` (bool, default true), `thinking` (`minimal`|`low`|`medium`|`high`, default `minimal`; `gemini-3.8-live-extended-thinking` requires non-minimal), `temperature` (0-2), `max_tokens` (1-8192). Out-of-range values reject the join with `bad join payload`.
+`model_config` fields are all optional. Omit `model` to use the daemon's `GEMINI_MODEL` (default `gemini-3.1-flash-live-preview` when unset). Voice tuning: `silence_ms` (100-3000, default 700), `prefix_ms` (0-1000, default 100), `start_sensitivity` / `end_sensitivity` (`low`|`high`, default `low`), `interrupt` (bool, default true), `thinking` (`minimal`|`low`|`medium`|`high`, default `minimal`; `gemini-3.8-live-extended-thinking` requires non-minimal), `temperature` (0-2), `max_tokens` (1-8192). Out-of-range values reject the join with `bad join payload`.
 
 **`leave`** — end the active session
 
@@ -103,7 +112,7 @@ Newline-delimited JSON over unix socket. Nine actions:
 
 **`cancel_say`** — barge-in: cut off an in-flight `say` synthesis/playback, e.g. because a new message superseded it.
 
-**`think`** — emit a soft thinking-tone audio cue while the model is generating, so speak-mode doesn't sit in dead silence.
+**`think`** — accepted and ignored. The thinking tone was removed; the action stays so older parents do not get an unknown-action error.
 
 While a session is active, gem-voice pushes events on the same socket:
 
