@@ -15,7 +15,7 @@ Here is a session as the parent bot sees it. Each line is one JSON object. Lines
 // bot starts a live call
 {"id": "1", "action": "join", "owner_user_id": "123456789012345678",
  "persona": {"name": "Bot", "system_prompt": "You are a concise voice assistant."},
- "model_config": {"model": "gemini-3.1-flash-live-preview", "voice": "Aoede", "silence_ms": 700},
+ "model_config": {"model": "gemini-3.8-live", "voice": "Aoede", "silence_ms": 700},
  "tools": [{"name": "get_quote", "description": "Latest stock price",
             "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}}}]}
 {"id": "1", "ok": true, "session_id": "sess-9f3a1c02"}
@@ -82,7 +82,7 @@ Every request carries an `id` and an `action`.
 - `thinking` (`minimal`, `low`, `medium` or `high`, default `minimal`). The model `gemini-3.8-live-extended-thinking` needs more than `minimal`, and `gemini-3.8-live` is sent no thinking setting.
 - `temperature` (0 to 2) and `max_tokens` (1 to 8192)
 
-`tts_config` takes a `model` (`gemini-2.5-flash-preview-tts`, `gemini-2.5-pro-preview-tts` or `gemini-3.1-flash-tts-preview`) and a `style`, delivery instructions of up to 500 characters.
+`tts_config` takes a `model` (`gemini-3.8-flash-tts` or `gemini-3.8-flash-lite-tts`) and a `style`, delivery instructions of up to 500 characters.
 
 | Event | Fields | Meaning |
 |---|---|---|
@@ -117,7 +117,7 @@ Settings come from the environment and `.env`.
 |---|---|---|
 | `GEMINI_API_KEY` | required | The daemon will not start without it |
 | `DISCORD_OWNER_USER_ID` | required | The daemon will not start without it |
-| `GEMINI_MODEL` | `gemini-3.1-flash-live-preview` | Live model used when `join` names none |
+| `GEMINI_MODEL` | `gemini-3.8-live` | Live model used when `join` names none |
 | `GEMINI_VOICE` | `Aoede` | Voice for `say` when the request names none |
 | `IPC_SOCKET_PATH` | `$XDG_RUNTIME_DIR/gem-voice.sock` | Socket path. Falls back to `/tmp/gem-voice.sock`. |
 | `LOG_LEVEL` | `INFO` | Log verbosity |
@@ -128,7 +128,7 @@ Settings come from the environment and `.env`.
 | `GEM_VOICE_VIDEO` | `0` | Set to `1` for continuous video. It lowers the frame resolution and compresses the context with a sliding window. |
 | `GEM_VOICE_VIDEO_FPS` | `1` | Most video frames a second sent to Gemini |
 | `GEM_VOICE_VIDEO_QUEUE` | `30` | Video frames held before the oldest is dropped |
-| `GEM_VOICE_TTS_MODEL` | `gemini-2.5-flash-preview-tts` | TTS model for `say` |
+| `GEM_VOICE_TTS_MODEL` | `gemini-3.8-flash-tts` | TTS model for `say` |
 | `GEM_VOICE_SAY_SYNTH_CONCURRENCY` | `4` | TTS chunks synthesized at once |
 | `GEM_VOICE_SAY_LEAD_S` | `0.3` | Head start, in seconds, before `say` settles to real-time pace |
 

@@ -12,6 +12,7 @@ from gem_voice.audio import (
     stereo_to_mono,
     OpusEncoder,
     OpusDecoder,
+    pcm_from_tts_audio,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -178,3 +179,36 @@ def test_opus_decode_invalid_returns_frame_not_crash():
     result = decoder.decode(b"\x00\x01\x02")
     assert isinstance(result, bytes)
     assert len(result) == 960  # 480 mono samples * 2 bytes (int16)
+
+
+# --- TTS output decoding -------------------------------------------------
+
+def _wav(pcm: bytes, rate: int, channels: int = 1) -> bytes:
+    import io
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def test_tts_wav_output_is_unwrapped_to_bare_pcm():
+    pcm = np.arange(480, dtype=np.int16).tobytes()
+    assert pcm_from_tts_audio(_wav(pcm, 24000), "audio/wav") == (pcm, 24000)
+
+
+def test_tts_raw_l16_output_passes_through_with_its_rate():
+    pcm = bytes(960)
+    assert pcm_from_tts_audio(pcm, "audio/L16;codec=pcm;rate=24000") == (pcm, 24000)
+
+
+def test_tts_output_without_a_rate_assumes_24k():
+    assert pcm_from_tts_audio(bytes(4), None) == (bytes(4), 24000)
+
+
+def test_tts_stereo_wav_is_refused():
+    with pytest.raises(ValueError):
+        pcm_from_tts_audio(_wav(bytes(8), 24000, channels=2), "audio/wav")

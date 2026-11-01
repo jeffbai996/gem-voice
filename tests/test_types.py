@@ -18,7 +18,7 @@ def test_config_required_fields_only():
     )
     assert c.gemini_api_key == "key123"
     assert c.discord_owner_user_id == "user456"
-    assert c.gemini_model == "gemini-3.1-flash-live-preview"
+    assert c.gemini_model == "gemini-3.8-live"
     assert c.gemini_voice == "Aoede"
     assert c.gemini_language == "en-US"
     assert c.log_level == "INFO"

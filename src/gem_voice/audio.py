@@ -108,6 +108,30 @@ def resample_pcm16(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     return dst_f.astype(np.int16).tobytes()
 
 
+def pcm_from_tts_audio(data: bytes, mime_type: str | None) -> tuple[bytes, int]:
+    """Return (int16 mono PCM, sample rate) from a Gemini TTS audio part.
+
+    The 2.5 TTS models return bare L16 with the rate in the MIME type; the 3.8
+    models return a WAV file. Playing a WAV header as samples is an audible
+    click, so it is stripped here.
+    """
+    if data[:4] == b"RIFF":
+        import io
+        import wave
+        with wave.open(io.BytesIO(data), "rb") as w:
+            if w.getnchannels() != 1 or w.getsampwidth() != 2:
+                raise ValueError(
+                    f"unsupported TTS audio: {w.getnchannels()} channels, "
+                    f"{8 * w.getsampwidth()}-bit")
+            return w.readframes(w.getnframes()), w.getframerate()
+    rate = 24000
+    for param in (mime_type or "").split(";"):
+        key, _, value = param.strip().partition("=")
+        if key == "rate" and value.isdigit():
+            rate = int(value)
+    return data, rate
+
+
 def mono_to_stereo(mono_pcm: bytes) -> bytes:
     """Duplicate each mono int16 sample into L+R for stereo."""
     arr = np.frombuffer(mono_pcm, dtype=np.int16)

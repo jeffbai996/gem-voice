@@ -66,9 +66,11 @@ class _FakeSessionManager:
         self.pushed_video = getattr(self, 'pushed_video', [])
         self.pushed_video.append(frame)
 
-    async def say(self, text, voice=None) -> None:
+    async def say(self, text, voice=None, tts_config=None) -> None:
         self.said = getattr(self, "said", [])
         self.said.append((text, voice))
+        self.tts_configs = getattr(self, "tts_configs", [])
+        self.tts_configs.append(tts_config)
 
     async def cancel_say(self) -> bool:
         self.cancel_say_called = getattr(self, "cancel_say_called", 0) + 1
@@ -357,6 +359,23 @@ async def test_say_then_cancel_say_routes_to_session(short_sock_path):
         cancel_resp = await _send_recv(sock, {"action": "cancel_say", "id": "c1"})
         assert cancel_resp == {"id": "c1", "ok": True, "cancelled": True}
         assert sm.cancel_say_called == 1
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_say_accepts_ga_tts_models_and_refuses_retired_ones(short_sock_path):
+    sock = short_sock_path
+    sm = _FakeSessionManager()
+    server = IpcServer(socket_path=sock, session_manager=sm)
+    await server.start()
+    try:
+        ok = await _send_recv(sock, {"action": "say", "id": "t1", "text": "hi",
+                                     "tts_config": {"model": "gemini-3.8-flash-lite-tts"}})
+        assert ok == {"id": "t1", "ok": True}
+        retired = await _send_recv(sock, {"action": "say", "id": "t2", "text": "hi",
+                                          "tts_config": {"model": "gemini-2.5-flash-preview-tts"}})
+        assert retired == {"id": "t2", "ok": False, "error": "unknown TTS model"}
     finally:
         await server.stop()
 

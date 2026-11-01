@@ -27,6 +27,7 @@ from dataclasses import replace
 from gem_voice.audio import (
     OpusDecoder,
     OpusEncoder,
+    pcm_from_tts_audio,
     resample_pcm16,
 )
 from gem_voice.gemini_live import GeminiLiveSession
@@ -225,10 +226,10 @@ class Session:
             return out or [s]
 
         chunks = _chunk_for_tts(text)
-        model = (tts_config or {}).get("model") or os.environ.get("GEM_VOICE_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+        model = (tts_config or {}).get("model") or os.environ.get("GEM_VOICE_TTS_MODEL", "gemini-3.8-flash-tts")
         style = (tts_config or {}).get("style", "")
 
-        def _synthesize(segment: str) -> bytes:
+        def _synthesize(segment: str) -> tuple[bytes, str | None]:
             # Gemini TTS shares the exact prebuilt voice set as Gemini Live, so
             # voice_name = our configured voice => identical voice. `voice` (the
             # /voice type pick, passed per-say) overrides the configured default;
@@ -245,9 +246,10 @@ class Session:
                         voice_config=gt.VoiceConfig(
                             prebuilt_voice_config=gt.PrebuiltVoiceConfig(
                                 voice_name=(voice or self._config.gemini_voice))))))
-            return resp.candidates[0].content.parts[0].inline_data.data  # 24kHz s16le mono
+            inline = resp.candidates[0].content.parts[0].inline_data
+            return inline.data, getattr(inline, "mime_type", None)
 
-        async def _synth_retry(segment: str) -> "bytes | None":
+        async def _synth_retry(segment: str) -> "tuple[bytes, str | None] | None":
             # TTS preview API is occasionally flaky — retry so a one-off hiccup
             # doesn't drop a chunk (the text reply already posted).
             for attempt in range(3):
@@ -270,7 +272,7 @@ class Session:
         _synth_sem = asyncio.Semaphore(
             int(os.environ.get("GEM_VOICE_SAY_SYNTH_CONCURRENCY", "4")))
 
-        async def _synth_bounded(seg: str) -> "bytes | None":
+        async def _synth_bounded(seg: str) -> "tuple[bytes, str | None] | None":
             async with _synth_sem:
                 return await _synth_retry(seg)
 
@@ -278,11 +280,12 @@ class Session:
 
         async def _producer() -> None:
             for t in synth_tasks:
-                pcm24 = await t
-                if pcm24 is None:
+                audio = await t
+                if audio is None:
                     continue
                 try:
-                    pcm48 = resample_pcm16(pcm24, src_rate=24000, dst_rate=48000)
+                    pcm, rate = pcm_from_tts_audio(*audio)
+                    pcm48 = resample_pcm16(pcm, src_rate=rate, dst_rate=48000)
                 except Exception as e:  # noqa: BLE001
                     log.warning("say_resample_failed", extra={"error": str(e)})
                     continue

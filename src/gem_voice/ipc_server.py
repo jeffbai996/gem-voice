@@ -175,7 +175,7 @@ class IpcServer:
             if not isinstance(tts, dict) or set(tts) - {"model", "style"}:
                 return {"id": req_id, "ok": False, "error": "invalid TTS settings"}
             if tts.get("model") is not None and tts["model"] not in {
-                "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts", "gemini-3.1-flash-tts-preview"}:
+                "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"}:
                 return {"id": req_id, "ok": False, "error": "unknown TTS model"}
             if not isinstance(tts.get("style", ""), str) or len(tts.get("style", "")) > 500:
                 return {"id": req_id, "ok": False, "error": "invalid TTS style"}

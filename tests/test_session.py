@@ -301,8 +301,8 @@ async def test_cancel_say_noop_when_nothing_playing(base_config, monkeypatch):
 async def test_explicit_live_model_is_not_replaced_by_daemon_default(persona, patched_gemini):
     config = Config(gemini_api_key='key', discord_owner_user_id='owner', gemini_model='gemini-3.8-live')
     session = Session(config)
-    await session.start(persona, ModelConfig(model='gemini-3.1-flash-live-preview'), 'owner')
-    assert patched_gemini.connect.call_args.args[1].model == 'gemini-3.1-flash-live-preview'
+    await session.start(persona, ModelConfig(model='gemini-3.8-live-extended-thinking', thinking='low'), 'owner')
+    assert patched_gemini.connect.call_args.args[1].model == 'gemini-3.8-live-extended-thinking'
     await session.stop()
 
 
@@ -316,13 +316,29 @@ async def test_tts_model_and_delivery_style_reach_synthesis(base_config, monkeyp
         content=SimpleNamespace(parts=[SimpleNamespace(inline_data=SimpleNamespace(data=bytes(960)))]))])
     monkeypatch.setattr(google.genai, 'Client', lambda **_: client)
     session = Session(base_config)
-    await session.say('Hello.', 'Kore', {'model': 'gemini-3.1-flash-tts-preview', 'style': 'Speak slowly'})
+    await session.say('Hello.', 'Kore', {'model': 'gemini-3.8-flash-lite-tts', 'style': 'Speak slowly'})
     await session._active_say_task
     request = client.models.generate_content.call_args.kwargs
-    assert request['model'] == 'gemini-3.1-flash-tts-preview'
+    assert request['model'] == 'gemini-3.8-flash-lite-tts'
     assert 'Speak slowly' in request['contents']
     assert 'Hello.' in request['contents']
     assert request['config'].speech_config.voice_config.prebuilt_voice_config.voice_name == 'Kore'
+
+@pytest.mark.asyncio
+async def test_tts_defaults_to_the_ga_flash_model(base_config, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import google.genai
+    monkeypatch.delenv('GEM_VOICE_TTS_MODEL', raising=False)
+    client = MagicMock()
+    client.models.generate_content.return_value = SimpleNamespace(candidates=[SimpleNamespace(
+        content=SimpleNamespace(parts=[SimpleNamespace(inline_data=SimpleNamespace(data=bytes(960), mime_type='audio/L16;codec=pcm;rate=24000'))]))])
+    monkeypatch.setattr(google.genai, 'Client', lambda **_: client)
+    session = Session(base_config)
+    await session.say('Hello.')
+    await session._active_say_task
+    assert client.models.generate_content.call_args.kwargs['model'] == 'gemini-3.8-flash-tts'
+
 
 @pytest.mark.asyncio
 async def test_stop_cancels_speak_even_without_a_live_call(base_config, monkeypatch):

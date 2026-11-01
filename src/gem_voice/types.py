@@ -15,7 +15,7 @@ class Config:
     """Daemon-wide configuration, loaded once from env at startup."""
     gemini_api_key: str
     discord_owner_user_id: str
-    gemini_model: str = "gemini-3.1-flash-live-preview"
+    gemini_model: str = "gemini-3.8-live"
     gemini_voice: str = "Aoede"
     gemini_language: str = "en-US"
     log_level: str = "INFO"
