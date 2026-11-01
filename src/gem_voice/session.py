@@ -193,7 +193,7 @@ class Session:
         """Speak `text` in gem-voice's configured voice via Gemini TTS, emitting
         it as AUDIO_OUT frames over the SAME encode/broadcast path the live model
         uses — so it sounds identical. Drives /voice speak (text-driven): the
-        parent feeds chat-Gemma's reply, we synthesize + stream it back. Needs no
+        parent feeds the text model's reply, we synthesize + stream it back. Needs no
         live Gemini session — the IPC broadcaster runs independently of one."""
         import base64
         import re
@@ -293,7 +293,7 @@ class Session:
 
         # CONSUMER: encode + pace frames from each chunk as it arrives, on ONE
         # continuous playback clock so chunks butt up seamlessly. Same realtime
-        # pacer (burst a small lead to fill gem-bot's jitter bank, then coast at
+        # pacer (burst a small lead to fill the parent bot's jitter buffer, then coast at
         # 20ms/frame). The clock starts at the FIRST emitted frame so the wait
         # for chunk-1 synth doesn't make us burst to "catch up".
         encoder = OpusEncoder()

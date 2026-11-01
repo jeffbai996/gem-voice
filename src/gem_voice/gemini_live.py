@@ -40,7 +40,7 @@ def _build_live_config(persona: Persona, model_config: ModelConfig,
     output transcription tells us what it tried to say.
     """
     # Always give voice web grounding via the built-in google_search tool — text
-    # Gemma has it, voice lacked it. On the 3.x live model built-in tools combine
+    # chat has it, voice lacked it. On the 3.x live model built-in tools combine
     # with custom function-calling, so google_search grounds alongside the IPC
     # function declarations.
     cfg_tools = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
@@ -112,7 +112,7 @@ class GeminiLiveSession:
         self._connected = False
         # Session-resumption state. Gemini Live hangs up the WebSocket on a
         # timer (a goAway after ~minutes) — without resuming, the call just
-        # dies mid-conversation (Jeff's "doesn't stay alive more than ~3 min").
+        # dies mid-conversation.
         # We keep the latest resumption handle the server pushes and reconnect
         # with it; the model context carries over. _stopping guards a
         # deliberate teardown from racing a reconnect.
